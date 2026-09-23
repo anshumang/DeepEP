@@ -64,6 +64,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     const auto lane_idx = ptx::get_lane_idx();
     constexpr bool kDoExpandedSend = not kAllowMultipleReduction and kUseExpandedLayout;
 
+    // Scale-out put schedule granularity. Tokens are keyed into buckets by
+    // source token index (contiguous per channel, so buckets rotate along the
+    // recorded order), and both the scale-up sweep and the forward replay walk
+    // the buckets as alternating (remote, local) chunks. Because the key is a
+    // pure per-token function, both roles derive the same restricted order for
+    // every (channel, peer) pair and count-based tail gating is unchanged.
+    // 1 degenerates to the remote-first two-pass schedule.
+    constexpr int kNumInterleaveBuckets = 8;
+
     // Combine vector type selection
     using combine_vec_t = typename CombineVecTraits<kNumHiddenBytes>::vec_t;
     constexpr int kHiddenVec = kNumHiddenBytes / sizeof(combine_vec_t);
@@ -189,7 +198,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
             stored_token_idx[i] = -1;
         #pragma unroll 1
-        for (int sweep = 0; sweep < 2; ++ sweep) {
+        for (int sweep = 0; sweep < 2 * kNumInterleaveBuckets; ++ sweep) {
         #pragma unroll
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
             stored_ll_idx[i] = 0;
@@ -224,7 +233,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 if (in_sweep) {
                     const auto src_global = __ldg(src_metadata + stored_token_idx[j] * kSweepMetadataStride);
                     const bool is_local = (src_global / (kNumMaxTokensPerRank * kNumScaleupRanks)) == scaleout_rank_idx;
-                    in_sweep = (sweep == 0) != is_local;
+                    in_sweep = (((sweep % 2) == 0) != is_local) and
+                               (src_global % kNumInterleaveBuckets) == (sweep / 2);
                 }
                 wip_mask |= static_cast<mask_t>(ptx::gather(in_sweep)) << (j * 32);
             }
@@ -483,22 +493,26 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // Replay the dispatch
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
         #pragma unroll 1
-        for (int replay_pass = 0; replay_pass < 2; ++ replay_pass) {
+        for (int replay_pass = 0; replay_pass < 2 * kNumInterleaveBuckets; ++ replay_pass) {
         for (int i = 0; ; ++ i) {
             const auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
             const auto src_scaleout_rank_idx = src_rank_idx / kNumScaleupRanks;
             const auto src_token_idx = src_token_global_idx % kNumMaxTokensPerRank;
+            if (src_token_global_idx < 0)
+                break;
+
+            // Bucketed interleave: pass 2b replays remote-origin tokens of bucket b,
+            // pass 2b+1 the local-origin ones, so scale-out puts issue uniformly
+            // across the replay instead of in one leading burst
+            if ((((replay_pass % 2) == 0) == (src_scaleout_rank_idx == scaleout_rank_idx)) or
+                (src_token_global_idx % kNumInterleaveBuckets) != (replay_pass / 2))
+                continue;
+
             auto stored_src_scaleup_rank_idx = lane_idx < kNumTopk ?
                 __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + lane_idx) : -1;
             auto stored_src_slot_idx = lane_idx < kNumTopk ?
                 __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + kNumTopk + lane_idx) : -1;
-            if (src_token_global_idx < 0)
-                break;
-
-            // Two-pass schedule: deferred tokens are revisited by the other pass
-            if ((replay_pass == 0) == (src_scaleout_rank_idx == scaleout_rank_idx))
-                continue;
 
             // Scaleup rank mask
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up peers");
@@ -670,17 +684,12 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             }
         }
 
-        if (replay_pass == 0) {
-            flush_last_tma_and_record_batch();
-            last_src_scaleout_rank_idx = -1;
-            if (ptx::elect_one_sync()) {
-                #pragma unroll
-                for (int dst = 0; dst < kNumScaleoutRanks; ++ dst)
-                    issue_batched_rdma(dst);
-            }
-            __syncwarp();
         }
-        }
+
+        // NOTES: no per-pass batch flush: partial batches ride across chunk
+        // boundaries (per-destination slots stay contiguous) and complete every
+        // `kBatchSize` tokens of their class, keeping the put count unchanged;
+        // the final flush below covers the remainders
 
         // Issue the last TMA and record operation for last RDMA
         if constexpr (kAllowMultipleReduction)
