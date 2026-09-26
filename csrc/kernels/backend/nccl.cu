@@ -9,6 +9,8 @@
 //
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -130,7 +132,23 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
             return ctx;
         };
 
-        if (scaleout_active) {
+        // EP_GIN_LAYOUT_OVERRIDE=<contexts>x<signals> requests exactly that GIN layout,
+        // bypassing the 256-QP budget model and its context clamp. For experiments that need
+        // one data QP per channel (e.g. 12 SM x 4 channels + notify = 49 contexts, 4 part
+        // signals each); whether the NIC grants it is decided by ncclDevCommCreate.
+        int override_ctx = 0, override_signals = 0;
+        if (const char* layout = std::getenv("EP_GIN_LAYOUT_OVERRIDE"); layout != nullptr and layout[0] != '\0') {
+            EP_HOST_ASSERT(std::sscanf(layout, "%dx%d", &override_ctx, &override_signals) == 2 and
+                           override_ctx >= elastic::gin_alloc::kMinGinContextCnt and override_signals >= 1 and
+                           "EP_GIN_LAYOUT_OVERRIDE must be <contexts>x<signals>, contexts >= 2, signals >= 1");
+        }
+
+        if (override_ctx > 0 and scaleout_active) {
+            gin_config.gin_context_cnt = override_ctx;
+            gin_config.gin_indexed_signals_cnt = override_signals;
+            printf("[WARN] DeepEP GIN layout override: %d contexts x %d indexed signals (EP_GIN_LAYOUT_OVERRIDE)\n",
+                   override_ctx, override_signals);
+        } else if (scaleout_active) {
             gin_config = elastic::gin_alloc::make_gin_resources(resolve_gin_context_cnt());
         } else {
             gin_config.gin_context_cnt = resolve_gin_context_cnt();
