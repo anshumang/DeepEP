@@ -64,6 +64,11 @@ public:
             flags += " -Xcompiler -rdynamic -lineinfo";
         if (get_env("EP_GIN_GDAKI_DEBUG", 0))
             flags += " -DNCCL_DEVICE_GIN_GDAKI_ENABLE_DEBUG=1";
+        // Thread-exclusive GIN contexts: data channels that own a QP post with
+        // NCCL_GIN_RESOURCE_SHARING_THREAD instead of CTA (see comm::get_qp_mode). Requires
+        // one QP per channel and exactly two scale-out ranks; the launches assert both.
+        if (get_env("EP_GIN_THREAD_EXCLUSIVE", 0))
+            flags += " -DEP_GIN_THREAD_EXCLUSIVE=1";
         flags += fmt::format(" -I {}/include", nccl_root.c_str());
 
         // Some special flags for EP

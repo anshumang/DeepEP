@@ -164,6 +164,9 @@ static void* launch_combine(void* x,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
                             const at::cuda::CUDAStream& stream) {
+    if (get_env<int>("EP_GIN_THREAD_EXCLUSIVE"))
+        EP_HOST_ASSERT(num_scaleout_ranks == 2 and
+                       "EP_GIN_THREAD_EXCLUSIVE: one posting thread per data QP holds only with 2 scale-out ranks");
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
     auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);

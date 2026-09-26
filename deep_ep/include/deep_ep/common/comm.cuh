@@ -99,10 +99,22 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
     constexpr int kNumAvailableQPs = kNumQPs - static_cast<int>(kWithNotifyWarps);
     const int qp_idx = channel_to_qp<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
         sm_idx, channel_in_sm_idx, is_notify_warp);
+#if EP_GIN_THREAD_EXCLUSIVE
+    // Every data channel owns its QP and one thread posts on it (the channel's put lane in
+    // dispatch, the proxy lane or elected thread in combine), so the channel's contexts can
+    // use the thread-exclusive post path. The notify QP above stays CTA: several threads post
+    // on it. The single-poster property also needs exactly two scale-out ranks, which the
+    // host launch asserts.
+    static_assert(kNumSMs * kNumChannelsPerSM <= kNumAvailableQPs,
+                  "EP_GIN_THREAD_EXCLUSIVE needs one QP per data channel (raise num_qps, e.g. "
+                  "EP_GIN_LAYOUT_OVERRIDE=<SMs*channels+1>x<parts>)");
+    return {qp_idx, NCCL_GIN_RESOURCE_SHARING_THREAD};
+#else
     if constexpr (kNumSMs <= kNumAvailableQPs)
         return {qp_idx, kSharingCTA};
     else
         return {qp_idx, kSharingGrid};
+#endif
 }
 
 // Companion to `get_qp_mode`: within a QP, gives a unique per-channel signal id

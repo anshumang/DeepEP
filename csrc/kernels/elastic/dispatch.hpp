@@ -245,6 +245,9 @@ static void launch_dispatch(void* x, void* sf,
 
     // Utils
     const auto num_ranks = num_scaleout_ranks * num_scaleup_ranks;
+    if (get_env<int>("EP_GIN_THREAD_EXCLUSIVE"))
+        EP_HOST_ASSERT(num_scaleout_ranks == 2 and
+                       "EP_GIN_THREAD_EXCLUSIVE: one posting thread per data QP holds only with 2 scale-out ranks");
 
     // Notify warps
     // TODO: why don't we use 4 notify warps?
