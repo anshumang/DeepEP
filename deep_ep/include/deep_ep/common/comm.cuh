@@ -117,6 +117,20 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
 #endif
 }
 
+// Skip-doorbell experiment (EP_GIN_SKIP_DOORBELL_FIRST=N, a JIT define): the first N puts a
+// channel issues on its QP carry ncclGinOptFlagsAggregateRequests, so they write their WQEs
+// without a fence or doorbell and put N+1 rings once for all of them. Only valid where every
+// channel issues more than N puts per launch (dispatch: 4 parts x >= 1 sub-put; combine: the
+// proxy ring); the plugin's max_batch (16) bounds N. Returns the extra put flags for the put
+// with 0-based ordinal `put_ordinal` on its QP.
+__device__ __forceinline__ constexpr int skip_doorbell_flags(const int& put_ordinal) {
+#if EP_GIN_SKIP_DOORBELL_FIRST
+    return put_ordinal < EP_GIN_SKIP_DOORBELL_FIRST ? static_cast<int>(ncclGinOptFlagsAggregateRequests) : 0;
+#else
+    return 0;
+#endif
+}
+
 // Companion to `get_qp_mode`: within a QP, gives a unique per-channel signal id
 // (position of this channel among all channels sharing the same QP). Uses the same
 // BALANCED CONTIGUOUS partition as `get_qp_mode` (see `qp_mapping.cuh`), so the id is

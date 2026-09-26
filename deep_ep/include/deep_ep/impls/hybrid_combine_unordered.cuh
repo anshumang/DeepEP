@@ -835,7 +835,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                             desc.recv_ptr, desc.send_ptr,
                             desc.num_bytes,
                             desc.dst,
-                            0, /*flags=0*/
+                            comm::skip_doorbell_flags(static_cast<int>(tail[forward_warp_idx])),
                             ncclGin_SignalAdd{ring_signal_id[forward_warp_idx], static_cast<uint64_t>(1)}
                         );
 
@@ -880,7 +880,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         desc.recv_ptr, desc.send_ptr,
                         desc.num_bytes,
                         desc.dst,
-                        0, /*flags=0*/
+                        comm::skip_doorbell_flags(static_cast<int>(tail)),
                         ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
                     );
 

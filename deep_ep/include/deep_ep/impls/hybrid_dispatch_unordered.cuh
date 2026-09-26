@@ -516,6 +516,7 @@ hybrid_unordered_dispatch_impl(
         int coalesce_flushed = 0;
         int stored_flushed_parts = 0;
         int stored_flushed_subs = 0;
+        int flushed_puts = 0;  // puts this lane has issued on its QP (skip-doorbell ordinal)
         const auto cur_sub_size = [&]() {
             const int p = stored_flushed_parts < kNumParts ? stored_flushed_parts : kNumParts - 1;
             return sub_part_size_at<kNumSubParts>(part_size(p), stored_flushed_subs);
@@ -541,8 +542,9 @@ hybrid_unordered_dispatch_impl(
                 scaleout_recv_buffer.get_token_buffer(slot).get_base_ptr(),
                 send_ch.get_token_buffer(slot).get_base_ptr(),
                 scaleout_token_layout.get_num_bytes<false>() * num_put_tokens,
-                lane_idx, 0,
+                lane_idx, comm::skip_doorbell_flags(flushed_puts),
                 ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
+            ++ flushed_puts;
             coalesce_flushed = up_to;
             if (sub_idx + 1 >= num_sub_parts_at<kNumSubParts>(part_size(part_idx))) {
                 stored_flushed_subs = 0;

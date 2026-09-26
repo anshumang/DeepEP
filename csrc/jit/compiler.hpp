@@ -69,6 +69,10 @@ public:
         // one QP per channel and exactly two scale-out ranks; the launches assert both.
         if (get_env("EP_GIN_THREAD_EXCLUSIVE", 0))
             flags += " -DEP_GIN_THREAD_EXCLUSIVE=1";
+        // Skip-doorbell experiment: the first N puts per channel per launch defer their doorbell
+        // (see comm::skip_doorbell_flags). N is bounded by the plugin's max_batch.
+        if (int n = get_env("EP_GIN_SKIP_DOORBELL_FIRST", 0); n > 0)
+            flags += fmt::format(" -DEP_GIN_SKIP_DOORBELL_FIRST={}", n);
         flags += fmt::format(" -I {}/include", nccl_root.c_str());
 
         // Some special flags for EP
