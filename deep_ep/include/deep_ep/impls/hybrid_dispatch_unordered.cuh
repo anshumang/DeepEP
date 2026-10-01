@@ -40,6 +40,51 @@ __device__ __forceinline__ bool unpack_scaleout_header(const int64_t& header, co
     return header < 0 and ((header >> 32) & 0x7fffffff) == (iteration & 0x7fffffff);
 }
 
+// MEASUREMENT BRANCH: read `%globaltimer`, which is already nanoseconds -- no SM-clock-rate
+// conversion is needed. `clock64()` would need one, and its rate is neither documented as constant
+// across SMs nor immune to DVFS, so it is the wrong source for an absolute latency figure.
+// `volatile` plus the "memory" clobber is what stops the compiler from sinking or hoisting the read
+// across the `gin.put` it brackets.
+__device__ __forceinline__ uint64_t ep_globaltimer_ns() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t) :: "memory");
+    return t;
+}
+
+// MEASUREMENT BRANCH: `%smid` is the physical SM the issuing warp is resident on, so samples can be
+// attributed per SM rather than only per rank. It is not architecturally stable across preemption,
+// but a dispatch is not preempted mid-flight, so within one launch the attribution is sound.
+__device__ __forceinline__ uint32_t ep_smid() {
+    uint32_t s;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(s));
+    return s;
+}
+
+// Pack one sample into a single int64 so the whole record is one store and one atomic slot:
+//
+//     bits  0..31   ns delta (`%globaltimer`), saturating
+//     bits 32..43   `%smid`      (physical SM, 12 bits)
+//     bits 44..49   `warp_idx`   (warp within the block, 6 bits)
+//     bits 50..55   `lane_idx`   (lane within the warp, 6 bits)
+//
+// Carrying sm/warp/lane per sample is what lets the host reconstruct the `EP_PUT_CALLS
+// sm=.. warp=.. lane=..` lines that `tools/put_call_stats.py` consumes, WITHOUT a per-lane
+// register array. A register array cannot work at this scale: a lane here issues ~940 puts, so
+// the 12-slot array used on GB300/RoCE would keep 1.3% of them and bias every percentile toward
+// each lane's first few puts.
+//
+// The delta SATURATES instead of wrapping, so a pathological outlier can never alias up into the
+// smid field and silently mislabel a sample. 2^32 ns is 4.3 s; a put that slow is a hang, not a
+// latency measurement.
+__device__ __forceinline__ int64_t ep_pack_sample(const uint64_t dt_ns, const uint32_t smid,
+                                                  const uint32_t warp, const uint32_t lane) {
+    const uint64_t dt = dt_ns > 0xffffffffull ? 0xffffffffull : dt_ns;
+    return static_cast<int64_t>(dt
+                                | (static_cast<uint64_t>(smid & 0xfffu) << 32)
+                                | (static_cast<uint64_t>(warp & 0x3fu) << 44)
+                                | (static_cast<uint64_t>(lane & 0x3fu) << 50));
+}
+
 #ifndef EP_NUM_SUB_PARTS
 #define EP_NUM_SUB_PARTS 2
 #endif
@@ -170,7 +215,10 @@ hybrid_unordered_dispatch_impl(
     void* buffer,
     void* workspace, void* mapped_host_workspace,
     const int scaleout_rank_idx, const int scaleup_rank_idx,
-    const int dispatch_iteration) {
+    const int dispatch_iteration,
+    // MEASUREMENT BRANCH: per-`gin.put` injection-latency capture. `put_ns_samples` is null unless
+    // `EP_PUT_NS=1`, and the kernel then records nothing and behaves exactly as upstream.
+    int64_t* put_ns_samples, unsigned long long* put_ns_count, const int64_t put_ns_capacity) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
@@ -538,6 +586,14 @@ hybrid_unordered_dispatch_impl(
                                .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
             stage_part_header(send_ch, slot, count, /*more=*/not is_final);
             const int num_put_tokens = count > 0 ? count : 1;
+            // MEASUREMENT BRANCH: bracket ONLY the put, so the sample is its injection cost (how
+            // long the call takes to return) and not its completion. The signal stays fused into
+            // the request, i.e. the unmodified default path.
+            //
+            // Every lane that reaches this point records its own sample. There is deliberately no
+            // lane guard: `flush_part` already returned early for `lane_idx == scaleout_rank_idx`,
+            // so a `lane_idx == 0` guard would record nothing at all on scale-out rank 0.
+            const uint64_t ep_put_t0 = ep_globaltimer_ns();
             gin.put<ncclTeamTagRail>(
                 scaleout_recv_buffer.get_token_buffer(slot).get_base_ptr(),
                 send_ch.get_token_buffer(slot).get_base_ptr(),
@@ -545,6 +601,15 @@ hybrid_unordered_dispatch_impl(
                 lane_idx, comm::skip_doorbell_flags(flushed_puts),
                 ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
             ++ flushed_puts;
+            const uint64_t ep_put_t1 = ep_globaltimer_ns();
+            if (put_ns_samples != nullptr) {
+                // Count every put but store only those that fit, so the final counter can be
+                // compared against the capacity to DETECT an overflow rather than silently drop.
+                const auto ep_put_slot = atomicAdd(put_ns_count, 1ull);
+                if (static_cast<int64_t>(ep_put_slot) < put_ns_capacity)
+                    put_ns_samples[ep_put_slot] =
+                        ep_pack_sample(ep_put_t1 - ep_put_t0, ep_smid(), warp_idx, lane_idx);
+            }
             coalesce_flushed = up_to;
             if (sub_idx + 1 >= num_sub_parts_at<kNumSubParts>(part_size(part_idx))) {
                 stored_flushed_subs = 0;

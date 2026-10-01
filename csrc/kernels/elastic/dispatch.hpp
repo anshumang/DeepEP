@@ -72,6 +72,10 @@ public:
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
         int dispatch_iteration;
+        // MEASUREMENT BRANCH: per-`gin.put` injection-latency capture (unordered hybrid only).
+        int64_t* put_ns_samples;
+        unsigned long long* put_ns_count;
+        int64_t put_ns_capacity;
 
         jit::LaunchArgs launch_args;
     };
@@ -185,7 +189,8 @@ static void __instantiate_kernel() {{
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
                 args.scaleout_rank_idx, args.scaleup_rank_idx,
-                args.dispatch_iteration
+                args.dispatch_iteration,
+                args.put_ns_samples, args.put_ns_count, args.put_ns_capacity
             ));
         }
     }
@@ -238,6 +243,9 @@ static void launch_dispatch(void* x, void* sf,
                             // this handle feeds; direct dispatch ignores it.
                             const bool& do_expand,
                             const int& dispatch_iteration,
+                            // MEASUREMENT BRANCH: per-`gin.put` injection-latency capture.
+                            int64_t* put_ns_samples, unsigned long long* put_ns_count,
+                            const int64_t& put_ns_capacity,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -308,6 +316,8 @@ static void launch_dispatch(void* x, void* sf,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .dispatch_iteration = dispatch_iteration,
+        .put_ns_samples = put_ns_samples, .put_ns_count = put_ns_count,
+        .put_ns_capacity = put_ns_capacity,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);

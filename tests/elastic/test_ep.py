@@ -555,6 +555,55 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Test MoE kernels
     test_dispatch_combine(buffer, args)
 
+    # MEASUREMENT BRANCH: dump this rank's per-`gin.put` injection-latency samples (nanoseconds).
+    if os.environ.get('EP_PUT_NS_DIR'):
+        import socket
+        samples, attempted = buffer.get_gin_put_ns()
+        out_dir = os.environ['EP_PUT_NS_DIR']
+        os.makedirs(out_dir, exist_ok=True)
+        samples.numpy().tofile(os.path.join(out_dir, f'put_ns_rank{rank_idx}.bin'))
+        print(f'[PUT_NS] rank={rank_idx} host={socket.gethostname()} '
+              f'stored={samples.numel()} attempted={attempted} '
+              f'overflow={bool(attempted > samples.numel())}', flush=True)
+
+        # One EP_PUT_CALLS line per (sm, warp, lane), carrying EVERY put's duration in us, so
+        # `tools/put_call_stats.py` can compute percentiles from the log alone -- the same
+        # contract as the GB300/RoCE recipe. Differences from that recipe, both deliberate:
+        #   * printed host-side after readback, not by an in-kernel printf, so emitting it
+        #     cannot perturb the very interval being timed;
+        #   * no per-lane register array, so `n` is the lane's FULL put count (~940 here) and
+        #     no value is dropped. `overflow` is the global dropped count from the device
+        #     buffer, identical on every line, not a per-lane figure.
+        #   * `peer` == `lane`: only one lane per warp issues, so they are the same number.
+        # Set EP_PUT_CALLS=0 to suppress (the .bin dump above is unaffected).
+        if os.environ.get('EP_PUT_CALLS', '1') != '0':
+            import numpy as _np
+            _raw = samples.numpy().astype('uint64')
+            _ns = (_raw & 0xffffffff).astype('int64')
+            _sm = ((_raw >> 32) & 0xfff).astype('int64')
+            _wp = ((_raw >> 44) & 0x3f).astype('int64')
+            _ln = ((_raw >> 50) & 0x3f).astype('int64')
+            _dropped = max(0, int(attempted) - int(samples.numel()))
+            _key = (_sm << 12) | (_wp << 6) | _ln
+            # Each line MUST stay under PIPE_BUF (4096 B) or it is not written atomically, and
+            # 16 ranks writing concurrently to one stdout splice each other's lines mid-number.
+            # At ~7 chars/value, 256 values + the header is ~1.9 KB, comfortably inside that.
+            # A lane's ~940 puts therefore span several lines, distinguished by `seq=`;
+            # put_call_stats.py pools them, so the split is invisible to the statistics.
+            _CHUNK = 256
+            for _k in _np.unique(_key):
+                _m = _key == _k
+                _s, _w, _l = int(_k >> 12), int((_k >> 6) & 0x3f), int(_k & 0x3f)
+                _v = _ns[_m]
+                _total = int(_v.size)
+                for _q in range(0, _total, _CHUNK):
+                    _part = _v[_q:_q + _CHUNK]
+                    _us = ' '.join(f'{_x / 1000.0:.3f}' for _x in _part)
+                    print(f'EP_PUT_CALLS rank={rank_idx} sm={_s} warp={_w} lane={_l} peer={_l} '
+                          f'seq={_q // _CHUNK} n={int(_part.size)} total={_total} '
+                          f'overflow={_dropped} us={_us} timing_endpoint=gin_put_return',
+                          flush=True)
+
     # Pressure tests
     if args.do_pressure_test:
         pressure_iteration_count = args.pressure_iterations if args.pressure_iterations != 0 else int(1e9)

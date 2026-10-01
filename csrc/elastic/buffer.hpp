@@ -58,6 +58,14 @@ class ElasticBuffer {
 
     mutable int dispatch_iteration = 0;
 
+    // MEASUREMENT BRANCH: device buffer of per-`gin.put` injection latencies in nanoseconds
+    // (`%globaltimer` deltas), plus the attempted-put counter. Allocated lazily on the first
+    // dispatch and only when `EP_PUT_NS=1`; otherwise these stay null and the kernel skips
+    // recording entirely, so the default path is unaffected.
+    mutable int64_t* put_ns_samples = nullptr;
+    mutable unsigned long long* put_ns_count = nullptr;
+    mutable int64_t put_ns_capacity = 0;
+
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
 
@@ -194,6 +202,49 @@ public:
 
     std::tuple<int, int> get_logical_domain_size() const {
         return {nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks};
+    }
+
+    // MEASUREMENT BRANCH: allocate the `gin.put` latency capture buffers on first use.
+    void ensure_put_ns_buffer() const {
+        if (put_ns_samples != nullptr or get_env<int>("EP_PUT_NS") == 0)
+            return;
+        const auto requested = get_env<int>("EP_PUT_NS_CAPACITY");
+        put_ns_capacity = requested > 0 ? static_cast<int64_t>(requested) : (static_cast<int64_t>(8) << 20);
+        CUDA_RUNTIME_CHECK(cudaMalloc(&put_ns_samples, put_ns_capacity * sizeof(int64_t)));
+        CUDA_RUNTIME_CHECK(cudaMalloc(&put_ns_count, sizeof(unsigned long long)));
+        CUDA_RUNTIME_CHECK(cudaMemset(put_ns_samples, 0, put_ns_capacity * sizeof(int64_t)));
+        CUDA_RUNTIME_CHECK(cudaMemset(put_ns_count, 0, sizeof(unsigned long long)));
+        printf("DeepEP: gin.put injection-latency capture ON, capacity %lld samples\n",
+               static_cast<long long>(put_ns_capacity));
+        // This build times with `%globaltimer`, which is ALREADY nanoseconds, so no clock
+        // constant is applied and none can be silently wrong. The GB300/RoCE recipe instead
+        // uses `clock64()` with a hardcoded kProfClockKhz, which is wrong on any other part.
+        // Print the real SM clock so a clock64-derived figure from that platform can be
+        // checked against this device rather than assumed.
+        int ep_clock_khz = 0;
+        CUDA_RUNTIME_CHECK(cudaDeviceGetAttribute(&ep_clock_khz, cudaDevAttrClockRate, 0));
+        printf("DeepEP: EP_CLOCK_KHZ=%d (informational; globaltimer needs no clock constant)\n",
+               ep_clock_khz);
+    }
+
+    // Returns (samples, attempted). `attempted` counts every put; `samples` holds only the first
+    // `put_ns_capacity` of them, so `attempted > samples.numel()` means the buffer overflowed.
+    std::tuple<torch::Tensor, int64_t> get_gin_put_ns() const {
+        unsigned long long attempted = 0;
+        if (put_ns_count != nullptr)
+            CUDA_RUNTIME_CHECK(cudaMemcpy(&attempted, put_ns_count, sizeof(attempted),
+                                          cudaMemcpyDeviceToHost));
+        const auto stored = std::min<int64_t>(static_cast<int64_t>(attempted), put_ns_capacity);
+        auto out = torch::empty({stored}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+        if (stored > 0)
+            CUDA_RUNTIME_CHECK(cudaMemcpy(out.data_ptr<int64_t>(), put_ns_samples,
+                                          stored * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        return {out, static_cast<int64_t>(attempted)};
+    }
+
+    void reset_gin_put_ns() const {
+        if (put_ns_count != nullptr)
+            CUDA_RUNTIME_CHECK(cudaMemset(put_ns_count, 0, sizeof(unsigned long long)));
     }
 
     // ReSharper disable once CppMemberFunctionMayBeStatic
@@ -1088,6 +1139,7 @@ public:
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
         ++ dispatch_iteration;
+        ensure_put_ns_buffer();
 
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
@@ -1119,6 +1171,7 @@ public:
                         not prefer_overlap_with_compute,
                         allow_multiple_reduction, do_expand,
                         dispatch_iteration,
+                        put_ns_samples, put_ns_count, put_ns_capacity,
                         comm_stream);
 
         // Received token counters
@@ -1499,6 +1552,8 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
+        .def("get_gin_put_ns", &ElasticBuffer::get_gin_put_ns)
+        .def("reset_gin_put_ns", &ElasticBuffer::reset_gin_put_ns)
         .def("combine", &ElasticBuffer::combine);
     m.def("create_cpu_handle", &ElasticBuffer::create_cpu_handle);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);

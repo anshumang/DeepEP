@@ -545,6 +545,33 @@ class ElasticBuffer:
         """
         self.runtime.barrier(use_comm_stream, with_cpu_sync, sequential)
 
+    def get_gin_put_ns(self):
+        """
+        MEASUREMENT BRANCH: per-`gin.put` injection latencies from the unordered scale-out
+        dispatch kernel, packed one int64 per recorded put:
+
+            bits  0..31  ns delta (`%globaltimer`), saturating at 0xffffffff
+            bits 32..43  `%smid`    -- physical SM
+            bits 44..49  `warp_idx` -- warp within the block
+            bits 50..55  `lane_idx` -- lane within the warp
+
+        So `ns = s & 0xffffffff`, `sm = (s >> 32) & 0xfff`, `warp = (s >> 44) & 0x3f`,
+        `lane = (s >> 50) & 0x3f`. Samples recorded before this packing existed decode as
+        sm/warp/lane 0, because their high bits are zero.
+
+        Only populated when `EP_PUT_NS=1` was set before the first dispatch.
+
+        Returns:
+            samples: 1-D CPU int64 tensor, one packed entry per recorded put.
+            attempted: total puts issued. Greater than `samples.numel()` means the device
+                buffer overflowed and the tail was dropped; raise `EP_PUT_NS_CAPACITY`.
+        """
+        return self.runtime.get_gin_put_ns()
+
+    def reset_gin_put_ns(self) -> None:
+        """MEASUREMENT BRANCH: restart the `gin.put` latency sample collection."""
+        self.runtime.reset_gin_put_ns()
+
     @staticmethod
     def _unpack_handle(handle: Optional[EPHandle] = None) \
         -> Tuple[Optional[int], Optional[int], Optional[list],

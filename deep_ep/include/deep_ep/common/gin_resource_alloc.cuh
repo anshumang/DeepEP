@@ -19,7 +19,7 @@ namespace deep_ep::elastic::gin_alloc {
 
 // NCCL GIN: provider resource budget.
 static constexpr int kTotalQPBudget              = 256;
-static constexpr int kMaxGinContextBudget        = 17;
+static constexpr int kMaxGinContextBudget        = 49;
 
 // Design constant: ScaleOut warps per SM used by the auto-tuner's budget math.
 // Matches the buffer's `!prefer_overlap_with_compute` cap on `num_channels_per_sm`
@@ -36,7 +36,24 @@ static constexpr int kMaxWarpsPerSM              = 4;
 // across all nodes in the rail group, so it is shared rail-wide — the signal
 // count scales with the number of channels (warps), not with the number of
 // nodes.
-static constexpr int kMaxSM           = (kTotalQPBudget - 2*kMaxGinContextBudget)/kMaxWarpsPerSM;
+// MEASUREMENT BRANCH: pinned, instead of being derived from the QP budget, and lowered to the
+// SM count we actually launch.
+//
+// `kMaxSM` feeds only `kMaxScaleoutWarps`, which feeds only the `static_assert` below. It is an
+// upper bound on the SMs a kernel may launch -- not the size of anything -- so deriving it from
+// `kTotalQPBudget` made that assert self-referential: raising the budget also raised the warp
+// ceiling the budget was being checked against.
+//
+// At 55 it demanded coverage for 220 warps while the measurement runs launch 12 SMs x 4 channels =
+// 48 warps. That over-reservation is what forced `kTotalQPBudget` up to 400, and the budget is what
+// sets EFA hardware-counter demand: each context costs 2 + 2*signals_per_ctx counters, so demand is
+// ~2*kTotalQPBudget and nearly independent of the context count. 400 asked EFA for 686 counters at
+// ctx = 49 and 770 at ctx = 11; both failed `cntr_open_ext` with ENOMEM. Pinning `kMaxSM` to the 12
+// SMs we launch lets the budget return to 256, which needs 392 counters at ctx = 49.
+//
+// Trade-off: 256 leaves only 3 signals/context at ctx = 49, so per-channel parts drop from 4 to 3.
+// Raise to 294 to restore 4 parts (490 counters) if EFA has the headroom.
+static constexpr int kMaxSM           = 12;
 static constexpr int kMaxScaleoutWarps           = kMaxSM * kMaxWarpsPerSM;
 
 struct GinResourceConfig {
@@ -66,8 +83,8 @@ __forceinline__ __device__ __host__ constexpr GinResourceConfig make_gin_resourc
 
 // Each ScaleOut warp (== channel) needs its own dedicated indexed signal id, so the total
 // signal budget (ctx * signals/ctx) must cover the worst-case warp count for EVERY legal
-// context count, not just the default. The tightest points are ctx = 13 and ctx = 17, both at
-// 221 against the 220-warp ceiling -- one signal of slack. Do not raise `kMaxSM` /
+// context count, not just the default. At `kTotalQPBudget` = 256 over ctx in [2, 49] the tightest
+// point is ctx = 43, at 129 signals against the 48-warp ceiling. Do not raise `kMaxSM` /
 // `kMaxWarpsPerSM`, widen the context range, or lower `kTotalQPBudget` without re-checking.
 __forceinline__ __host__ constexpr bool all_gin_context_counts_cover_warps() {
     for (int ctx = kMinGinContextCnt; ctx <= kMaxGinContextCnt; ++ ctx)
