@@ -71,6 +71,17 @@ public:
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
 
+        // Compiles out combine's rail put and the arrival wait that depends on it, to time
+        // everything around the scale-out transfer with the transfer removed. COMBINE OUTPUT IS
+        // WRONG in such a build, so it must be run without the correctness check.
+        if (get_env("EP_PROXY_SKIP_PUT", 0))
+            flags += " -DEP_PROXY_SKIP_PUT=1";
+
+        // Compiles out combine's entry barrier, to price the cross-rank rendezvous. The barrier is
+        // a correctness requirement, so such a build RACES -- timing only.
+        if (get_env("EP_SKIP_BARRIER", 0))
+            flags += " -DEP_SKIP_BARRIER=1";
+
         // Different configurations have different compute power, so combine's
         // batching is adjusted accordingly.
         flags += fmt::format(" -DEP_COMBINE_BATCH_SIZE={}",

@@ -22,6 +22,26 @@
 #define EP_COMBINE_BATCH_SIZE 6
 #endif
 
+// Compiles out the proxy's rail put and the arrival wait that depends on it, so everything
+// around the scale-out transfer can be timed with the transfer removed. COMBINE OUTPUT IS
+// WRONG with this on -- no data crosses the rail, so the correctness check will report a
+// mismatch and must be skipped. Timing only; the numbers are not comparable to a correct run.
+// Set EP_PROXY_SKIP_PUT=1 per job -- see csrc/jit/compiler.hpp.
+#ifndef EP_PROXY_SKIP_PUT
+#define EP_PROXY_SKIP_PUT 0
+#endif
+static constexpr bool kProxySkipPut = EP_PROXY_SKIP_PUT != 0;
+
+// Compiles out combine's entry barrier, to separate what the cross-rank rendezvous costs from
+// what the kernel's own work costs. The barrier is a correctness requirement -- it is what makes
+// the scale-up tail cleaning of the previous kernel visible -- so a build without it RACES and
+// its output is not trustworthy even when it happens to match. Timing only.
+// Set EP_SKIP_BARRIER=1 per job -- see csrc/jit/compiler.hpp.
+#ifndef EP_SKIP_BARRIER
+#define EP_SKIP_BARRIER 0
+#endif
+static constexpr bool kSkipBarrier = EP_SKIP_BARRIER != 0;
+
 namespace deep_ep::elastic {
 
 // Iterate the whole forward metadata list and count how many tokens (forward slots) this channel
@@ -180,9 +200,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
     // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
-        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    if constexpr (not kSkipBarrier) {
+        comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
+            gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    }
 
     // Adjust register count at certain cases
     // TODO: support more cases, or try to make channel count more aligned
@@ -866,13 +888,18 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                 const auto issue_put = [&](const ProxyPutDesc& d, const int& ring_idx,
                                            const bool& ring_doorbell) {
-                    rail_ctx.put<ncclTeamTagRail>(
-                        d.recv_ptr, d.send_ptr,
-                        d.num_bytes,
-                        d.dst,
-                        ring_doorbell ? 0 : ncclGinOptFlagsAggregateRequests,
-                        ncclGin_SignalAdd{rail_signal_id, static_cast<uint64_t>(1)}
-                    );
+                    // Ring bookkeeping below stays unguarded: the forward warps must still see
+                    // their descriptors consumed, or they stall on a full ring instead of running
+                    // at the speed this build exists to measure.
+                    if constexpr (not kProxySkipPut) {
+                        rail_ctx.put<ncclTeamTagRail>(
+                            d.recv_ptr, d.send_ptr,
+                            d.num_bytes,
+                            d.dst,
+                            ring_doorbell ? 0 : ncclGinOptFlagsAggregateRequests,
+                            ncclGin_SignalAdd{rail_signal_id, static_cast<uint64_t>(1)}
+                        );
+                    }
                     ++ tail[ring_idx];
                     ptx::st_release_cta(proxy_ring_layout.get_tail(ring_idx), tail[ring_idx]);
                 };
@@ -909,23 +936,28 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             }
 
             // Wait for all arrivals from the peer rail SMs.
-            const auto shadow_ptr = rail_ctx.gin.getSignalShadowPtr(rail_signal_id);
-            const auto target = (*shadow_ptr += static_cast<uint64_t>(sm_num_expected_arrivals));
-            comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal =
-                    rail_ctx.gin.readSignal(rail_signal_id, 64, cuda::memory_order_acquire);
-                if (signal >= target)
-                    return true;
-                if (is_last_check) {
-                    // SM-wide, not per channel: one signal now covers every channel of this SM, so
-                    // the per-channel attribution the old message printed no longer exists.
-                    printf("DeepEP combine (scale-out wait all) timeout, scale-out: %d/%d, "
-                           "scale-up: %d/%d, sm: %d, signal: %lu, target: %lu, expected: %d\n",
-                           scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
-                           sm_idx, signal, target, sm_num_expected_arrivals);
-                }
-                return false;
-            });
+            // Skipped wholesale under kProxySkipPut. With no puts there are no SignalAdds, so the
+            // target could never be met -- and bumping the shadow for arrivals nobody sent would
+            // leave it corrupt for whatever reuses this comm afterwards.
+            if constexpr (not kProxySkipPut) {
+                const auto shadow_ptr = rail_ctx.gin.getSignalShadowPtr(rail_signal_id);
+                const auto target = (*shadow_ptr += static_cast<uint64_t>(sm_num_expected_arrivals));
+                comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                    const auto signal =
+                        rail_ctx.gin.readSignal(rail_signal_id, 64, cuda::memory_order_acquire);
+                    if (signal >= target)
+                        return true;
+                    if (is_last_check) {
+                        // SM-wide, not per channel: one signal now covers every channel of this SM, so
+                        // the per-channel attribution the old message printed no longer exists.
+                        printf("DeepEP combine (scale-out wait all) timeout, scale-out: %d/%d, "
+                               "scale-up: %d/%d, sm: %d, signal: %lu, target: %lu, expected: %d\n",
+                               scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
+                               sm_idx, signal, target, sm_num_expected_arrivals);
+                    }
+                    return false;
+                });
+            }
         }
         __syncwarp();
     }
