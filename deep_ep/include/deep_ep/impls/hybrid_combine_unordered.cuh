@@ -770,22 +770,14 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         }
         __syncwarp();
     } else {
-        // Proxy warp loop shape: arch-selected at JIT compile time.
-        //   SM100+ (B200) -> sequential single-lane sweeper.
-        //   otherwise (H200) -> parallel multi-lane (each lane owns its ring).
-        //
-        // B200 forward warps run faster so batches arrive at the proxy unevenly,
-        // driving high lane divergence in the parallel design. H200 forward warps
-        // are slower, so batches arrive more evenly and most lanes have work
-        // together -> low divergence.
-        //
-        // Divergence cost per put step: sum(Ln for n in 0..kNumForwardWarps-1)
-        // (all lanes' PC time) + lane-context-switch overhead. On B200 that beats
-        // the serial sweep; on H200 the parallel throughput gain dominates.
+        // Proxy warp loop shape: SM100+ always uses the sequential single-lane
+        // sweeper. SM90 also uses it when every SM owns its data QPs, allowing the
+        // elected lane to select THREAD sharing safely. When SMs share QPs, SM90
+        // retains the parallel multi-lane sweeper and GPU sharing.
         #if __CUDA_ARCH__ >= 1000
         constexpr bool kSingleLaneSweeper = true;
         #else
-        constexpr bool kSingleLaneSweeper = false;
+        constexpr bool kSingleLaneSweeper = kNumSMs <= kNumQPs - 1;
         #endif
 
         if constexpr (kSingleLaneSweeper) {
@@ -805,9 +797,13 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
                     ring_signal_id[forward_warp_idx] = static_cast<ncclGinSignal_t>(
                         comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
-                    const auto [qp, mode] =
+                    const auto [qp, mapped_mode] =
                         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
-                    new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, mode);
+                    const auto rail_mode = mapped_mode == NCCL_GIN_RESOURCE_SHARING_GPU
+                                             ? NCCL_GIN_RESOURCE_SHARING_GPU
+                                             : NCCL_GIN_RESOURCE_SHARING_THREAD;
+                    new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(
+                        nccl_dev_comm, nccl_window, qp, rail_mode);
                 }
 
                 while (num_forward_warps_done_cnt < kNumForwardWarps) {

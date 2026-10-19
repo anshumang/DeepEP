@@ -15,6 +15,7 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+#include <deep_ep/common/gin_resource_alloc.cuh>
 #include <deep_ep/common/handle.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/common/layout.cuh>
@@ -75,7 +76,7 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
 //   e.g. 48 channels / 4 QPs  -> {12,12,12,12}  (even; identical to before)
 //        4  channels / 3 QPs  -> QP0<-2, QP1<-1, QP2<-1  (was {2,2,0}, QP2 idle)
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
-__device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mode(
+__host__ __device__ __forceinline__ constexpr std::pair<int, ncclGinResourceSharingMode> get_qp_mode(
     const int& sm_idx, const int& channel_in_sm_idx, const bool& is_notify_warp = false) {
     static_assert(kNumQPs >= 1,
                   "kNumQPs must be >= 1. With 0 the kNumQPs == 1 fast path is skipped, "
@@ -104,6 +105,11 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
     else
         return {qp_idx, kSharingGrid};
 }
+
+static_assert(
+    get_qp_mode<12, gin_alloc::kDefaultGinContextCnt, 4, true>(0, 0).second ==
+        NCCL_GIN_RESOURCE_SHARING_CTA,
+    "default GIN context count must give 12 SMs exclusive data QPs");
 
 // Companion to `get_qp_mode`: within a QP, gives a unique per-channel signal id
 // (position of this channel among all channels sharing the same QP). Uses the same
