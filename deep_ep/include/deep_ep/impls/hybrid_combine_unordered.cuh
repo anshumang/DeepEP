@@ -195,6 +195,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // Different warp roles
     if (warp_idx < kNumScaleupWarps) {
         const auto channel_idx = sm_idx * kNumChannelsPerSM + warp_idx;
+        // Rebuild this warp's TMA buffer handle here instead of keeping the pre-split one live across
+        // the role split. As a kernel-wide value it is the register ptxas spills first when the
+        // forward warp's ring wait adds a loop-carried value, and its reloads land on the per-token
+        // TMA paths of both data warps. The warp index is re-read through an opaque asm so the
+        // compiler cannot merge this handle with the one computed before the split.
+        unsigned opaque_tid;
+        asm volatile("mov.u32 %0, %%tid.x;" : "=r"(opaque_tid));
+        const auto tma_buffer = tma_buffer_layout.get_rank_buffer(static_cast<int>(opaque_tid >> 5)).get_token_buffer(0);
+        const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
 
         // Adjust registers
         if constexpr (kAdjustRegisters)
@@ -441,6 +450,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     } else if (warp_idx < kNumDataWarps) {
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
+        // Rebuild this warp's TMA buffer handle here instead of keeping the pre-split one live across
+        // the role split. As a kernel-wide value it is the register ptxas spills first when the
+        // forward warp's ring wait adds a loop-carried value, and its reloads land on the per-token
+        // TMA paths of both data warps. The warp index is re-read through an opaque asm so the
+        // compiler cannot merge this handle with the one computed before the split.
+        unsigned opaque_tid;
+        asm volatile("mov.u32 %0, %%tid.x;" : "=r"(opaque_tid));
+        const auto tma_buffer = tma_buffer_layout.get_rank_buffer(static_cast<int>(opaque_tid >> 5)).get_token_buffer(0);
+        const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
 
         // Adjust registers
         if constexpr (kAdjustRegisters)
