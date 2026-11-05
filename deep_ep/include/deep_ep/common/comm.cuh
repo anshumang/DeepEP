@@ -12,6 +12,8 @@
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <cooperative_groups.h>
+#include <type_traits>
+#include <utility>
 #include <nccl.h>
 #include <nccl_device.h>
 
@@ -21,6 +23,30 @@
 #include <deep_ep/common/qp_mapping.cuh>
 
 namespace deep_ep::elastic::comm {
+
+// Thread-exclusive GIN handles (NCCL_GIN_RESOURCE_SHARING_THREAD) need the thread-exclusive Put of
+// NVIDIA/nccl ad35c997, in releases from 2.32.5; an older NCCL runs a THREAD handle down the
+// GPU-shared path, which is slower than CTA on a QP one SM owns. The version the kernel runs on
+// comes from the device API's ncclGin::_version(); headers without the accessor predate the Put
+// and keep the mapped mode, so the detection needs no feature macro.
+inline constexpr uint32_t kNcclThreadPutVersion = NCCL_VERSION(2, 32, 5);
+
+template <typename gin_t, typename = void>
+struct nccl_gin_has_version : std::false_type {};
+
+template <typename gin_t>
+struct nccl_gin_has_version<gin_t, std::void_t<decltype(std::declval<const gin_t&>()._version())>>
+    : std::true_type {};
+
+// A template so that the probe is a dependent expression: `if constexpr` discards it where the
+// accessor is absent instead of failing to compile.
+template <typename gin_t = ncclGin>
+__device__ __forceinline__ bool nccl_has_thread_put(const ncclDevComm_t& nccl_dev_comm) {
+    if constexpr (nccl_gin_has_version<gin_t>::value)
+        return gin_t(nccl_dev_comm, /*contextIndex=*/0)._version() >= kNcclThreadPutVersion;
+    else
+        return false;
+}
 
 static constexpr int64_t kNumOneSecCycles = 2000000000;  // An approximation of the GPU clock at 2000 MHz
 
