@@ -821,11 +821,13 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
                     const auto [qp, mapped_mode] =
                         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
-                    // This lane is the only poster on a QP this SM owns (CTA in the mapping),
-                    // so the handle can be thread-exclusive; a QP shared across SMs stays GPU.
-                    const auto rail_mode = mapped_mode == NCCL_GIN_RESOURCE_SHARING_GPU
-                                             ? NCCL_GIN_RESOURCE_SHARING_GPU
-                                             : NCCL_GIN_RESOURCE_SHARING_THREAD;
+                    // This lane is the only poster on a QP this SM owns (CTA in the mapping), so
+                    // the handle can be thread-exclusive where the NCCL implements the
+                    // thread-exclusive Put; otherwise, and on a QP shared across SMs, it keeps the
+                    // mapped mode.
+                    const auto rail_mode = mapped_mode == NCCL_GIN_RESOURCE_SHARING_CTA and comm::kNcclHasThreadPut
+                                             ? NCCL_GIN_RESOURCE_SHARING_THREAD
+                                             : mapped_mode;
                     new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, rail_mode);
                 }
 
