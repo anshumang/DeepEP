@@ -229,9 +229,30 @@ hybrid_unordered_dispatch_impl(
     const auto scaleout_token_layout = layout::TokenLayout(
         kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr, /*with_scaleout_hdr=*/true);
     constexpr int kNumFwdBuffers = kDoubleBufferForward ? kNumDispatchFwdBuffers : 1;
+
+    // One notify warp per SM posts the sender warps' scale-out puts thread-exclusively on the SM's QP,
+    // from a ring per (sender warp, scale-out peer) after the TMA pool. An entry holds the first slot,
+    // the part index and the token count of one put. Only with two scale-out ranks: with more peers,
+    // one thread posting all of the SM's puts is slower than the sender lanes posting them.
+    constexpr int kNumSmemTokenBytes =
+        math::constexpr_align(kNumHiddenBytes, ptx::kNumTMAAlignBytes) +
+        math::constexpr_align(kNumSFPacks * static_cast<int>(sizeof(sf_pack_t)), ptx::kNumTMAAlignBytes) +
+        math::constexpr_align(kNumTopk * 8 + (1 + kNumTopk) * 4, ptx::kNumTMAAlignBytes) +
+        math::constexpr_align(static_cast<int>(sizeof(ptx::mbarrier)), ptx::kNumTMAAlignBytes);
+    constexpr int kNumMaxSmemBytes = 232448;
+    constexpr int kNumPoolBuffers = kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps;
+    constexpr bool kOneQPPerSM = kNumQPs - static_cast<int>(kDataChannelsAboveQP0) == kNumSMs;
+    constexpr int kPostRingDepth = 4;
+    constexpr int kPostEntryInts = 3;
+    constexpr int kNumPostRings = kNumScaleoutWarps * kNumScaleoutRanks;
+    constexpr int kNumPostRingInts = kNumPostRings * (kPostRingDepth * kPostEntryInts + 2) + kNumScaleoutWarps;
+    constexpr bool kPostWarp = kNumNotifyWarps > 1 and kNumScaleoutRanks == 2 and kNumScaleoutWarps <= 32 and
+        kNumScaleupRanks + kNumExpertsPerRank <= (kNumNotifyWarps - 1) * 32 and
+        comm::kNcclHasThreadPut and kOneQPPerSM and
+        kNumSmemBytesForNotify + kNumPoolBuffers * kNumSmemTokenBytes +
+            kNumPostRingInts * static_cast<int>(sizeof(int)) <= kNumMaxSmemBytes;
     const auto tma_pool = layout::BufferLayout<true>(
-        token_layout, kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps, 1,
-        math::advance_ptr<int>(smem, kNumSmemBytesForNotify));
+        token_layout, kNumPoolBuffers, 1, math::advance_ptr<int>(smem, kNumSmemBytesForNotify));
     const bool is_forward_warp = warp_idx >= kNumNotifyWarps + kNumScaleoutWarps;
     const int fwd_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
     const int tma_pool_base = is_forward_warp
@@ -240,6 +261,10 @@ hybrid_unordered_dispatch_impl(
     const auto tma_buffer = tma_pool.get_rank_buffer(tma_pool_base).get_token_buffer(0);
     const auto tma_buffer_alt = tma_pool.get_rank_buffer(
         tma_pool_base + (kDoubleBufferForward and is_forward_warp ? 1 : 0)).get_token_buffer(0);
+    int* const post_ring = static_cast<int*>(tma_pool.get_buffer_end_ptr());
+    int* const post_head = post_ring + kNumPostRings * kPostRingDepth * kPostEntryInts;
+    int* const post_tail = post_head + kNumPostRings;
+    int* const post_done = post_tail + kNumPostRings;
 
     constexpr int kNumSlotsPerChannel = kNumParts * kBatchSize;
     const auto part_size = [&](const int& part) {
@@ -316,10 +341,26 @@ hybrid_unordered_dispatch_impl(
         if (kDoubleBufferForward and is_forward_warp)
             ptx::mbarrier_init_with_fence(mbarrier_ptr_alt, 1);
     }
-    __syncwarp();
+    if constexpr (kPostWarp) {
+        if (warp_idx == kNumNotifyWarps - 1) {
+            for (int i = lane_idx; i < kNumPostRings; i += 32) {
+                post_head[i] = 0;
+                post_tail[i] = 0;
+            }
+            if (lane_idx < kNumScaleoutWarps)
+                post_done[lane_idx] = 0;
+        }
+        __syncthreads();
+    } else {
+        __syncwarp();
+    }
 
     // Different warp roles
     if (warp_idx < kNumNotifyWarps) {
+        constexpr int kNumNotifyWorkWarps = kPostWarp ? kNumNotifyWarps - 1 : kNumNotifyWarps;
+        constexpr int kNumNotifyWorkThreads = kNumNotifyWorkWarps * 32;
+        const bool is_post_warp = kPostWarp and warp_idx == kNumNotifyWarps - 1;
+        if (not is_post_warp) {
         // Assign shared memory
         constexpr int kNumAlignedElems = kNumSmemBytesForNotify / sizeof(int);
         const auto rank_expert_count = math::advance_ptr<int>(smem, 0);
@@ -328,14 +369,19 @@ hybrid_unordered_dispatch_impl(
         // NOTES: if you want to change the order of different warp roles, please take care of the `thread_idx`
         int *rank_count = rank_expert_count, *expert_count = rank_expert_count + kNumRanks;
         #pragma unroll
-        for (int i = 0; i < kNumAlignedElems / kNumNotifyThreads; ++ i)
-            rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
-        ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+        for (int i = 0; i < kNumAlignedElems / kNumNotifyWorkThreads; ++ i)
+            rank_expert_count[i * kNumNotifyWorkThreads + thread_idx] = 0;
+        if constexpr (kPostWarp) {
+            for (int i = (kNumAlignedElems / kNumNotifyWorkThreads) * kNumNotifyWorkThreads + thread_idx;
+                 i < kNumAlignedElems; i += kNumNotifyWorkThreads)
+                rank_expert_count[i] = 0;
+        }
+        ptx::named_barrier<kNumNotifyWorkThreads>(kNotifyBarrierIndex);
 
         // Atomic add on shared memory
         EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes");
-        const auto global_warp_idx = sm_idx * kNumNotifyWarps + warp_idx;
-        for (int i = global_warp_idx; i < num_tokens; i += kNumNotifyWarps * kNumSMs) {
+        const auto global_warp_idx = sm_idx * kNumNotifyWorkWarps + warp_idx;
+        for (int i = global_warp_idx; i < num_tokens; i += kNumNotifyWorkWarps * kNumSMs) {
             // Expert choice can not be redundant
             // NOTES: no assertions here as they are expensive
             const auto dst_expert_idx = lane_idx < kNumTopk ?
@@ -348,11 +394,11 @@ hybrid_unordered_dispatch_impl(
             if (ptx::deduplicate(dst_rank_idx, lane_idx) and dst_rank_idx >= 0)
                 atomicAdd_block(rank_count + dst_rank_idx, 1);
         }
-        ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+        ptx::named_barrier<kNumNotifyWorkThreads>(kNotifyBarrierIndex);
 
         // Do full-grid reduction
         #pragma unroll
-        for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
+        for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyWorkThreads) {
             const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
             ptx::red_add(workspace_layout.get_notify_reduction_workspace_ptr() + i, counter);
         }
@@ -362,7 +408,7 @@ hybrid_unordered_dispatch_impl(
             // Reduce all SM's count
             // Wait all SMs' arrival
             #pragma unroll
-            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyThreads) {
+            for (int i = thread_idx; i < kNumRanks + kNumExperts; i += kNumNotifyWorkThreads) {
                 comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                     const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_notify_reduction_workspace_ptr() + i);
                     if ((status >> 32) == kNumSMs) {
@@ -384,11 +430,11 @@ hybrid_unordered_dispatch_impl(
                     return false;
                 });
             }
-            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            ptx::named_barrier<kNumNotifyWorkThreads>(kNotifyBarrierIndex);
 
             // Issue scaleout writes to peers
-            EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyThreads,
-                             "kNumScaleoutRanks must be less than kNumNotifyThreads");
+            EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyWorkThreads,
+                             "kNumScaleoutRanks must be less than kNumNotifyWorkThreads");
             if (thread_idx < kNumScaleoutRanks) {
                 const auto dst_scaleout_rank_idx = thread_idx;
                 gin.put<ncclTeamTagRail>(
@@ -436,7 +482,7 @@ hybrid_unordered_dispatch_impl(
 
             // Write into all scale-up peers' rank-level counters
             #pragma unroll
-            for (int i = thread_idx; i < kNumScaleupRanks; i += kNumNotifyThreads) {
+            for (int i = thread_idx; i < kNumScaleupRanks; i += kNumNotifyWorkThreads) {
                 // Wait scale-out arrival and reduce
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
                     return workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_peer_idx, i);
@@ -452,7 +498,7 @@ hybrid_unordered_dispatch_impl(
 
             // Atomic add into all scale-up peers' expert-level counters
             #pragma unroll
-            for (int i = thread_idx; i < kNumExpertsPerScaleout; i += kNumNotifyThreads) {
+            for (int i = thread_idx; i < kNumExpertsPerScaleout; i += kNumNotifyWorkThreads) {
                 // Wait scale-out arrival and reduce
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
                     return workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_peer_idx, i);
@@ -467,14 +513,14 @@ hybrid_unordered_dispatch_impl(
                     counter, dst_scaleup_rank_idx);
             }
             // There are shared memory reads above, a barrier is necessary
-            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            ptx::named_barrier<kNumNotifyWorkThreads>(kNotifyBarrierIndex);
 
             // NOTES: from now on, the `rank` and `expert`s size change into the local size
             expert_count = rank_expert_count + kNumScaleupRanks;
 
             // Wait local counters to be ready
             // NOTES: here we only care the prefix sum by scale-up peers (used for later epilogue), not all ranks
-            EP_STATIC_ASSERT(kNumNotifyWarps == 0 or kNumScaleupRanks + kNumExpertsPerRank <= kNumNotifyWarps * 32,
+            EP_STATIC_ASSERT(kNumNotifyWarps == 0 or kNumScaleupRanks + kNumExpertsPerRank <= kNumNotifyWorkThreads,
                              "Insufficient notify threads");
             comm::timeout_while<kNumTimeoutCycles>(thread_idx < kNumScaleupRanks + kNumExpertsPerRank,
                 [&](const bool& is_last_check) {
@@ -513,7 +559,7 @@ hybrid_unordered_dispatch_impl(
                 }
                 return false;
             });
-            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            ptx::named_barrier<kNumNotifyWorkThreads>(kNotifyBarrierIndex);
 
             // Do prefix sum by the warps of the first SM
             // NOTES: we may have fast implementation with `cub::BlockScan`, but it is too heavy to use
@@ -540,6 +586,83 @@ hybrid_unordered_dispatch_impl(
             } else if (warp_idx == 1) {
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
+            }
+        }
+        }
+
+        if constexpr (kPostWarp) {
+            if (is_post_warp) {
+                const auto post_qp_idx = comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, kDataChannelsAboveQP0>(
+                    sm_idx, 0, false).first;
+                const auto post_gin = handle::NCCLGin(nccl_dev_comm, nccl_window, post_qp_idx,
+                                                      NCCL_GIN_RESOURCE_SHARING_THREAD);
+                const bool owns_channel = lane_idx < kNumScaleoutWarps;
+                const int ring_base = (owns_channel ? lane_idx : 0) * kNumScaleoutRanks;
+                int tails[kNumScaleoutRanks];
+                #pragma unroll
+                for (int d = 0; d < kNumScaleoutRanks; ++ d)
+                    tails[d] = 0;
+                int idle_rounds = 0;
+                bool finished = not owns_channel;
+                while (true) {
+                    unsigned ready_dsts = 0;
+                    if (not finished) {
+                        #pragma unroll
+                        for (int d = 0; d < kNumScaleoutRanks; ++ d)
+                            if (d != scaleout_rank_idx and ptx::ld_acquire_cta(post_head + ring_base + d) != tails[d])
+                                ready_dsts |= 1u << d;
+                        if (ready_dsts == 0 and ptx::ld_acquire_cta(post_done + lane_idx) != 0) {
+                            bool drained = true;
+                            #pragma unroll
+                            for (int d = 0; d < kNumScaleoutRanks; ++ d)
+                                drained = drained and (d == scaleout_rank_idx or ptx::ld_acquire_cta(post_head + ring_base + d) == tails[d]);
+                            finished = drained;
+                        }
+                    }
+                    if (__all_sync(0xffffffffu, finished))
+                        break;
+                    const unsigned ready = __ballot_sync(0xffffffffu, ready_dsts != 0);
+                    if (ready == 0) {
+                        if (++ idle_rounds >= 64)
+                            __nanosleep(128);
+                        continue;
+                    }
+                    idle_rounds = 0;
+                    for (unsigned pending = ready; pending != 0; pending &= pending - 1) {
+                        const int c = __ffs(pending) - 1;
+                        const unsigned c_dsts = __shfl_sync(0xffffffffu, ready_dsts, c);
+                        #pragma unroll
+                        for (int d = 0; d < kNumScaleoutRanks; ++ d) {
+                            if (((c_dsts >> d) & 1u) == 0)
+                                continue;
+                            const int c_tail = __shfl_sync(0xffffffffu, tails[d], c);
+                            __syncwarp();
+                            if (lane_idx == 0) {
+                                const int* entry = post_ring +
+                                    ((c * kNumScaleoutRanks + d) * kPostRingDepth + c_tail % kPostRingDepth) * kPostEntryInts;
+                                const int slot = entry[0], part_idx = entry[1], num_put_tokens = entry[2];
+                                const int post_channel_idx = sm_idx * kNumChannelsPerSM + c;
+                                const auto recv_ch = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx)
+                                    .get_channel_buffer<kNumSlotsPerChannel>(post_channel_idx);
+                                const auto send_ch = scaleout_send_buffer.get_rank_buffer(d)
+                                    .get_channel_buffer<kNumSlotsPerChannel>(post_channel_idx);
+                                post_gin.put<ncclTeamTagRail>(
+                                    recv_ch.get_token_buffer(slot).get_base_ptr(),
+                                    send_ch.get_token_buffer(slot).get_base_ptr(),
+                                    scaleout_token_layout.get_num_bytes<false>() * num_put_tokens,
+                                    d, 0,
+                                    ncclGin_SignalAdd{static_cast<ncclGinSignal_t>(
+                                        comm::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
+                                                                     kNumParts, kDataChannelsAboveQP0>(sm_idx, c, part_idx)), 1ull});
+                            }
+                            __syncwarp();
+                            if (lane_idx == c) {
+                                tails[d] += 1;
+                                ptx::st_release_cta(post_tail + ring_base + d, tails[d]);
+                            }
+                        }
+                    }
+                }
             }
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
@@ -582,12 +705,31 @@ hybrid_unordered_dispatch_impl(
                                .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
             stage_part_header(send_ch, slot, count, /*more=*/not is_final);
             const int num_put_tokens = count > 0 ? count : 1;
-            gin.put<ncclTeamTagRail>(
-                scaleout_recv_buffer.get_token_buffer(slot).get_base_ptr(),
-                send_ch.get_token_buffer(slot).get_base_ptr(),
-                scaleout_token_layout.get_num_bytes<false>() * num_put_tokens,
-                lane_idx, 0,
-                ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
+            if constexpr (kPostWarp) {
+                const int ring = scaleout_warp_idx * kNumScaleoutRanks + lane_idx;
+                const int head = post_head[ring];
+                comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                    if (head - ptx::ld_acquire_cta(post_tail + ring) < kPostRingDepth)
+                        return true;
+                    if (is_last_check)
+                        printf("DeepEP hybrid dispatch (post ring full) timeout, scale-out: %d, scale-up: %d, "
+                               "channel: %d, dst: %d, head: %d\n",
+                               scaleout_rank_idx, scaleup_rank_idx, channel_idx, lane_idx, head);
+                    return false;
+                });
+                int* const entry = post_ring + (ring * kPostRingDepth + head % kPostRingDepth) * kPostEntryInts;
+                entry[0] = slot;
+                entry[1] = part_idx;
+                entry[2] = num_put_tokens;
+                ptx::st_release_cta(post_head + ring, head + 1);
+            } else {
+                gin.put<ncclTeamTagRail>(
+                    scaleout_recv_buffer.get_token_buffer(slot).get_base_ptr(),
+                    send_ch.get_token_buffer(slot).get_base_ptr(),
+                    scaleout_token_layout.get_num_bytes<false>() * num_put_tokens,
+                    lane_idx, 0,
+                    ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
+            }
             coalesce_flushed = up_to;
             if (sub_idx + 1 >= num_sub_parts_at<kNumSubParts>(part_size(part_idx))) {
                 stored_flushed_subs = 0;
@@ -810,6 +952,11 @@ hybrid_unordered_dispatch_impl(
             flush_part(coalesce_flushed, /*is_final=*/true);
         }
         __syncwarp();
+        if constexpr (kPostWarp) {
+            if (lane_idx == 0)
+                ptx::st_release_cta(post_done + scaleout_warp_idx, 1);
+            __syncwarp();
+        }
 
         // Flush unflushed tails
         update_scaleout_tail(true);
