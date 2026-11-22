@@ -96,6 +96,9 @@ public:
         // sub-puts, so the split stays regular there; SM90 and SM100 keep their flag strings unchanged.
         if (arch_major == 10 and arch_minor == 3)
             flags += " -DEP_NUM_TAIL_SUB_PARTS=2";
+
+        // The unordered dispatch gates a few shapes on the device (B200 and B300 both compile as sm_100f)
+        flags += fmt::format(" -DEP_DEVICE_ARCH={}", arch_major * 10 + arch_minor);
     }
 
     virtual ~Compiler() = default;

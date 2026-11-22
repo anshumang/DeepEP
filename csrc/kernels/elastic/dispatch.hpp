@@ -256,6 +256,7 @@ static void launch_dispatch(void* x, void* sf,
     int num_dispatch_warps = 0;
     int num_scaleout_warps = 0, num_forward_warps = 0;
     int num_threads = 0;
+    bool fwd_double_buffer = double_buffer_forward;
 
     // Maximize shared memory utilization
     if (num_scaleout_ranks == 1) {
@@ -268,6 +269,13 @@ static void launch_dispatch(void* x, void* sf,
         num_scaleout_warps = num_channels_per_sm;
         num_forward_warps = num_channels_per_sm;
         num_threads = (num_notify_warps + num_scaleout_warps + num_forward_warps) * 32;
+        // The current unordered kernel double-buffers the forward whenever the second forward buffer fits
+        // (the ordered and the legacy unordered kernels keep the caller's choice)
+        const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
+        if (not use_ordered_hybrid_kernel() and use_thread_put_unordered_kernels())
+            fwd_double_buffer = fwd_double_buffer or
+                static_cast<int64_t>(kNumDispatchBuffersPerChannel) * num_channels_per_sm *
+                        token_layout.get_num_bytes<true>() + num_notify_smem_bytes <= num_smem_bytes;
     }
 
     // Generate, build and launch
@@ -278,7 +286,7 @@ static void launch_dispatch(void* x, void* sf,
         .use_ordered_kernel = use_ordered_hybrid_kernel(),
         .allow_multiple_reduction = allow_multiple_reduction,
         .do_expand = do_expand,
-        .double_buffer_forward = double_buffer_forward,
+        .double_buffer_forward = fwd_double_buffer,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,
@@ -315,7 +323,7 @@ class DispatchCopyEpilogueRuntime final : public jit::LaunchRuntime<DispatchCopy
 public:
     struct Args {
         // Templated arguments
-        bool do_expand, cached_mode, do_zero_padding;
+        bool do_expand, cached_mode, do_zero_padding, wait_dispatch_done;
         int num_channels;
         int num_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
@@ -342,18 +350,23 @@ public:
 
     static std::string generate_impl(const Args& args) {
         // The epilogue reads the forward list the dispatch kernel wrote, so it follows the same
-        // generation selection (see `use_thread_put_unordered_kernels`).
+        // generation selection (see `use_thread_put_unordered_kernels`). Only the current generation
+        // has `kWaitDispatchDone`: the legacy dispatch keeps its exit barrier.
+        const bool use_current = use_thread_put_unordered_kernels();
+        const auto leading_args = use_current
+            ? fmt::format("{}, {}, {}, {}", args.do_expand, args.cached_mode, args.do_zero_padding, args.wait_dispatch_done)
+            : fmt::format("{}, {}, {}", args.do_expand, args.cached_mode, args.do_zero_padding);
         return fmt::format(R"(
 #include <deep_ep/impls/{}.cuh>
 
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
-                           use_thread_put_unordered_kernels() ? "dispatch_copy_epilogue" : "dispatch_copy_epilogue_legacy",
-                           args.do_expand, args.cached_mode, args.do_zero_padding,
+                           use_current ? "dispatch_copy_epilogue" : "dispatch_copy_epilogue_legacy",
+                           leading_args,
                            args.launch_args.grid_dim.first, args.num_channels, args.num_warps,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.num_hidden_bytes, args.num_sf_packs,
@@ -404,6 +417,10 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
         .do_expand = do_expand, .cached_mode = cached_mode, .do_zero_padding = do_zero_padding,
+        // The current unordered hybrid dispatch replaces its exit barrier with per-peer done counters
+        // (the ordered and the legacy unordered kernels keep it)
+        .wait_dispatch_done = num_scaleout_ranks > 1 and num_scaleup_ranks > 1 and
+                              not use_ordered_hybrid_kernel() and use_thread_put_unordered_kernels(),
         .num_channels = num_channels, .num_warps = num_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,

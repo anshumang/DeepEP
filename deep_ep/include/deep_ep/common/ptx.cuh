@@ -122,9 +122,20 @@ __forceinline__ __device__ void tma_store_fence() {
     asm volatile("fence.proxy.async.shared::cta;");
 }
 
+__forceinline__ __device__ void fence_proxy_async_global() {
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+
 template <int kNumRemainingWaits = 0>
 __forceinline__ __device__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(kNumRemainingWaits) : "memory");
+}
+
+// Waits until the shared memory sources of the bulk stores have been read, not until the
+// writes are complete
+template <int kNumRemainingWaits = 0>
+__forceinline__ __device__ void tma_store_wait_read() {
+    asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(kNumRemainingWaits) : "memory");
 }
 
 enum TMACacheHint: int64_t {
