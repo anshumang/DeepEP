@@ -360,6 +360,9 @@ class ElasticBuffer:
             sl_idx = int(os.environ['EP_OVERRIDE_RDMA_SL'])
 
         # Automatic QP count
+        # Experiment hook: EP_NUM_ALLOCATED_QPS stands in for the argument when the caller passes 0
+        if num_allocated_qps == 0 and os.environ.get('EP_NUM_ALLOCATED_QPS'):
+            num_allocated_qps = int(os.environ['EP_NUM_ALLOCATED_QPS'])
         if num_allocated_qps == 0 and (not self.allow_hybrid_mode or os.environ.get('EP_HYBRID_KERNEL', 'unordered') == 'ordered'):
             # Hybrid mode will consume more QPs; the extra QP is for notify warps.
             # The unordered hybrid kernels (`EP_HYBRID_KERNEL=unordered`) instead

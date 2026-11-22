@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -99,6 +101,12 @@ public:
 
         // The unordered dispatch gates a few shapes on the device (B200 and B300 both compile as sm_100f)
         flags += fmt::format(" -DEP_DEVICE_ARCH={}", arch_major * 10 + arch_minor);
+
+        // Experiment hook: extra JIT flags, comma-separated; appended last so they override the defaults above
+        if (auto extra = get_env<std::string>("EP_JIT_EXTRA_FLAGS"); not extra.empty()) {
+            std::replace(extra.begin(), extra.end(), ',', ' ');
+            flags += " " + extra;
+        }
     }
 
     virtual ~Compiler() = default;
