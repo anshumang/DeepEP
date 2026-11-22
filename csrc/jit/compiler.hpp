@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -96,6 +98,12 @@ public:
         // sub-puts, so the split stays regular there; SM90 and SM100 keep their flag strings unchanged.
         if (arch_major == 10 and arch_minor == 3)
             flags += " -DEP_NUM_TAIL_SUB_PARTS=2";
+
+        // Experiment hook: extra JIT flags, comma-separated; appended last so they override the defaults above
+        if (auto extra = get_env<std::string>("EP_JIT_EXTRA_FLAGS"); not extra.empty()) {
+            std::replace(extra.begin(), extra.end(), ',', ' ');
+            flags += " " + extra;
+        }
     }
 
     virtual ~Compiler() = default;
