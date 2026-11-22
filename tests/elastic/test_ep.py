@@ -66,6 +66,46 @@ def fold_expanded(expanded: Union[Tuple[torch.Tensor], torch.Tensor],
     return folded
 
 
+def generate_remote_share_topk(num_tokens: int, num_experts: int, num_topk: int,
+                               num_scaleout_ranks: int, num_scaleup_ranks: int, scaleout_rank_idx: int,
+                               remote_share: float, device: str = 'cuda'):
+    """
+    Expert selections with a set share on other scale-out ranks. Every token picks `num_topk` distinct ranks,
+    `remote_share * num_topk` of them on other scale-out ranks (the fractional part decided per token) and the
+    rest on its own scale-out rank, then one random expert on each picked rank. Every rank receives `num_topk`
+    selections per source token in expectation whatever the share, so the share moves traffic between the
+    scale-up and the scale-out paths without changing the work per rank.
+    """
+    num_ranks = num_scaleout_ranks * num_scaleup_ranks
+    num_experts_per_rank = num_experts // num_ranks
+    num_remote_ranks = num_ranks - num_scaleup_ranks
+    assert 0 <= remote_share <= 1 and (num_remote_ranks > 0 or remote_share == 0)
+    exact = remote_share * num_topk
+    num_remote = int(exact) + (torch.rand(num_tokens, device=device) < exact - int(exact)).int()
+    num_local = num_topk - num_remote
+    assert int(num_local.max()) <= num_scaleup_ranks and int(num_remote.max()) <= num_remote_ranks, \
+        'Not enough distinct ranks for the requested share'
+
+    # Random distinct local and remote ranks per token, the first `num_local` local ones and the first
+    # `num_remote` remote ones taken
+    local_ranks = torch.arange(num_scaleup_ranks, device=device) + scaleout_rank_idx * num_scaleup_ranks
+    local_perm = local_ranks[torch.argsort(torch.rand(num_tokens, num_scaleup_ranks, device=device), dim=1)]
+    k_idx = torch.arange(num_topk, device=device).unsqueeze(0).expand(num_tokens, num_topk)
+    ranks = torch.gather(local_perm, 1, k_idx.clamp(max=num_scaleup_ranks - 1))
+    if num_remote_ranks > 0:
+        all_ranks = torch.arange(num_ranks, device=device)
+        remote_ranks = all_ranks[all_ranks // num_scaleup_ranks != scaleout_rank_idx]
+        remote_perm = remote_ranks[torch.argsort(torch.rand(num_tokens, num_remote_ranks, device=device), dim=1)]
+        remote_k_idx = (k_idx - num_local.unsqueeze(1)).clamp(min=0, max=num_remote_ranks - 1)
+        ranks = torch.where(k_idx < num_local.unsqueeze(1), ranks, torch.gather(remote_perm, 1, remote_k_idx))
+
+    # Shuffle the picks of each token, so the local ones do not always take the first top-k slots
+    ranks = torch.gather(ranks, 1, torch.argsort(torch.rand(num_tokens, num_topk, device=device), dim=1))
+    topk_idx = ranks * num_experts_per_rank + torch.randint(num_experts_per_rank, (num_tokens, num_topk), device=device)
+    topk_weights = torch.rand(num_tokens, num_topk, device=device)
+    return topk_idx, topk_weights
+
+
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
     # Settings
@@ -82,9 +122,15 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                f' > #SM: {num_sms}, #QPs: {num_qps}/{buffer.num_allocated_qps}\n',
                once_in_node=True)
 
-    # Construct expert selections first (may have an unbalanced ratio here)
-    scores = get_unbalanced_scores(num_tokens, num_experts, buffer.num_ranks, num_topk, args.unbalanced_ratio, args.precise_unbalanced_ratio)
-    topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+    # Construct expert selections first (may have an unbalanced ratio or a set share on other scale-out ranks here)
+    if args.remote_share >= 0:
+        assert args.unbalanced_ratio == 1.0, '`--remote-share` does not combine with `--unbalanced-ratio`'
+        topk_idx, topk_weights = generate_remote_share_topk(
+            num_tokens, num_experts, num_topk, num_scaleout_ranks, num_scaleup_ranks,
+            buffer.scaleout_rank_idx, args.remote_share)
+    else:
+        scores = get_unbalanced_scores(num_tokens, num_experts, buffer.num_ranks, num_topk, args.unbalanced_ratio, args.precise_unbalanced_ratio)
+        topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
     topk_idx = topk_idx.to(deep_ep.topk_idx_t)
     if args.masked_ratio > 0:
         rand_mask = torch.rand_like(topk_idx, dtype=torch.float)
@@ -620,6 +666,9 @@ if __name__ == '__main__':
     parser.add_argument('--unbalanced-ratio', type=float, default=1.0, help='The MoE unbalanced ratio')
     parser.add_argument('--precise-unbalanced-ratio', action='store_true', help='Generate topk index with precise unbalanced ratio')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
+    parser.add_argument('--remote-share', type=float, default=-1.0,
+                        help='Share of the top-k picks of each token on other scale-out ranks, all on distinct ranks '
+                             '(negative: the default random selection)')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--ignore-local-traffic', action='store_true', help='Whether to ignore local traffic during bandwidth calculation')
     args = parser.parse_args()
