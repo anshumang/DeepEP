@@ -74,14 +74,15 @@ def generate_remote_share_topk(num_tokens: int, num_experts: int, num_topk: int,
     `remote_share * num_topk` of them on other scale-out ranks (the fractional part decided per token) and the
     rest on its own scale-out rank, then one random expert on each picked rank. Every rank receives `num_topk`
     selections per source token in expectation whatever the share, so the share moves traffic between the
-    scale-up and the scale-out paths without changing the work per rank.
+    scale-up and the scale-out paths without changing the work per rank. Random draws are float32, as the
+    test runs with a bfloat16 default dtype and the weights must be float32.
     """
     num_ranks = num_scaleout_ranks * num_scaleup_ranks
     num_experts_per_rank = num_experts // num_ranks
     num_remote_ranks = num_ranks - num_scaleup_ranks
     assert 0 <= remote_share <= 1 and (num_remote_ranks > 0 or remote_share == 0)
     exact = remote_share * num_topk
-    num_remote = int(exact) + (torch.rand(num_tokens, device=device) < exact - int(exact)).int()
+    num_remote = int(exact) + (torch.rand(num_tokens, dtype=torch.float32, device=device) < exact - int(exact)).int()
     num_local = num_topk - num_remote
     assert int(num_local.max()) <= num_scaleup_ranks and int(num_remote.max()) <= num_remote_ranks, \
         'Not enough distinct ranks for the requested share'
@@ -89,20 +90,20 @@ def generate_remote_share_topk(num_tokens: int, num_experts: int, num_topk: int,
     # Random distinct local and remote ranks per token, the first `num_local` local ones and the first
     # `num_remote` remote ones taken
     local_ranks = torch.arange(num_scaleup_ranks, device=device) + scaleout_rank_idx * num_scaleup_ranks
-    local_perm = local_ranks[torch.argsort(torch.rand(num_tokens, num_scaleup_ranks, device=device), dim=1)]
+    local_perm = local_ranks[torch.argsort(torch.rand(num_tokens, num_scaleup_ranks, dtype=torch.float32, device=device), dim=1)]
     k_idx = torch.arange(num_topk, device=device).unsqueeze(0).expand(num_tokens, num_topk)
     ranks = torch.gather(local_perm, 1, k_idx.clamp(max=num_scaleup_ranks - 1))
     if num_remote_ranks > 0:
         all_ranks = torch.arange(num_ranks, device=device)
         remote_ranks = all_ranks[all_ranks // num_scaleup_ranks != scaleout_rank_idx]
-        remote_perm = remote_ranks[torch.argsort(torch.rand(num_tokens, num_remote_ranks, device=device), dim=1)]
+        remote_perm = remote_ranks[torch.argsort(torch.rand(num_tokens, num_remote_ranks, dtype=torch.float32, device=device), dim=1)]
         remote_k_idx = (k_idx - num_local.unsqueeze(1)).clamp(min=0, max=num_remote_ranks - 1)
         ranks = torch.where(k_idx < num_local.unsqueeze(1), ranks, torch.gather(remote_perm, 1, remote_k_idx))
 
     # Shuffle the picks of each token, so the local ones do not always take the first top-k slots
-    ranks = torch.gather(ranks, 1, torch.argsort(torch.rand(num_tokens, num_topk, device=device), dim=1))
+    ranks = torch.gather(ranks, 1, torch.argsort(torch.rand(num_tokens, num_topk, dtype=torch.float32, device=device), dim=1))
     topk_idx = ranks * num_experts_per_rank + torch.randint(num_experts_per_rank, (num_tokens, num_topk), device=device)
-    topk_weights = torch.rand(num_tokens, num_topk, device=device)
+    topk_weights = torch.rand(num_tokens, num_topk, dtype=torch.float32, device=device)
     return topk_idx, topk_weights
 
 
