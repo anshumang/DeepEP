@@ -900,6 +900,7 @@ public:
         // Only for hybrid version
         int num_channels_per_sm = 1, num_channels = 1;
         const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
+        bool double_buffer_forward = not prefer_overlap_with_compute;
         if (nccl_context->num_scaleout_ranks > 1) {
             const auto dispatch_token_layout = get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk);
             const auto combine_token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
@@ -957,6 +958,13 @@ public:
                 -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
                            "shared memory cannot host a single dispatch channel at this token size");
+            // With compute overlap on, double-buffer the forward warp's TMA loads too when the second
+            // buffer fits without dropping a channel (EP_DISPATCH_FWD_DOUBLE_BUFFER=0 disables)
+            if (prefer_overlap_with_compute and get_env("EP_DISPATCH_FWD_DOUBLE_BUFFER", 1))
+                double_buffer_forward = static_cast<int64_t>(kNumDispatchBuffersPerChannel) * num_channels_per_sm *
+                                                dispatch_token_layout.get_num_bytes<true>() +
+                                            get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts) <=
+                                        num_smem_bytes;
             }
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
@@ -1117,7 +1125,7 @@ public:
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
                         cached_mode, do_cpu_sync,
-                        not prefer_overlap_with_compute,
+                        double_buffer_forward,
                         allow_multiple_reduction, do_expand,
                         comm_stream);
 
