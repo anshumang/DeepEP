@@ -102,6 +102,16 @@ public:
         // The unordered dispatch gates a few shapes on the device (B200 and B300 both compile as sm_100f)
         flags += fmt::format(" -DEP_DEVICE_ARCH={}", arch_major * 10 + arch_minor);
 
+        // Combine start and tail levers by architecture (EP_JIT_EXTRA_FLAGS, appended below, overrides them).
+        // SM90: the combine is bound by the forward warps' reduce, so an idle scale-up warp helps with the local
+        // tokens, with a short put ramp, early scale-up rows and eager first proxy rounds. SM100: the combine is
+        // bound by when the first puts land, so its first four puts per (channel, destination) carry two tokens.
+        if (arch_major == 9)
+            flags += " -DEP_COMBINE_SU_HELP=1 -DEP_COMBINE_RAMP_TOKENS=2 -DEP_COMBINE_RAMP_PUTS=2"
+                     " -DEP_COMBINE_EARLY_ROWS=4 -DEP_COMBINE_PROXY_EAGER_PUTS=7";
+        if (arch_major == 10 and arch_minor == 0)
+            flags += " -DEP_COMBINE_RAMP_TOKENS=2 -DEP_COMBINE_RAMP_PUTS=4";
+
         // Experiment hook: extra JIT flags, comma-separated; appended last so they override the defaults above
         if (auto extra = get_env<std::string>("EP_JIT_EXTRA_FLAGS"); not extra.empty()) {
             std::replace(extra.begin(), extra.end(), ',', ' ');

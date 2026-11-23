@@ -285,6 +285,8 @@ class ElasticBuffer:
                     thread-exclusive put (before 2.32.6), where the previous kernel generation
                     runs, 11 QPs and 21 signals per QP as before. An explicit value is
                     clamped into [2, 41] with a warning; `num_sms + 1` gives every SM its own QP
+                    (recommended above 12 SMs: at the default 13 QPs the SMs share data QPs, which
+                    slows the combine; one QP per SM restores it)
                     (the combine proxy then posts thread-exclusively). The signals per QP follow
                     from the provider budget, `(budget - 2 * qps) / qps` with budget 256 by
                     default (`EP_GIN_QP_BUDGET` raises it where the GIN connection spreads
