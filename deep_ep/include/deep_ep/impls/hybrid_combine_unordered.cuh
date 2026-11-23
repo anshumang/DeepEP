@@ -23,7 +23,27 @@
 #define EP_COMBINE_BATCH_SIZE 6
 #endif
 
+// Experiment, off by default: padded warpgroups at 7 channels per SM (5-7 with level 2), so that the
+// forward warps fill warpgroups 2-3 and the register split below applies as at 4 and 8 channels. 16 warps:
+// `[0, N)` scale-up, `N` the proxy, `(N, 8)` pads, `[8, 8 + N)` forward, `[8 + N, 16)` pads. Warpgroup 0
+// (scale-up only) gives registers back, warpgroup 1 (scale-up, proxy, pads) keeps the launch count,
+// warpgroups 2-3 (forward, pads) take more. Pads only take part in the prologue and their warpgroup's
+// `setmaxnreg`. The host (`combine.hpp`) launches 16 warps when it finds the level in `EP_JIT_EXTRA_FLAGS`.
+#ifndef EP_COMBINE_SPLIT7
+#define EP_COMBINE_SPLIT7 0
+#endif
+#ifndef EP_COMBINE_SPLIT7_FWD_REGS
+#define EP_COMBINE_SPLIT7_FWD_REGS 168
+#endif
+
 namespace deep_ep::elastic {
+
+constexpr bool use_combine_padded_warpgroups(const bool use_expanded_layout,
+                                             const int num_scaleup_warps, const int num_forward_warps) {
+    return not use_expanded_layout and num_scaleup_warps == num_forward_warps and
+           ((EP_COMBINE_SPLIT7 >= 1 and num_forward_warps == 7) or
+            (EP_COMBINE_SPLIT7 >= 2 and num_forward_warps >= 5 and num_forward_warps <= 7));
+}
 
 // Iterate the whole forward metadata list and count how many tokens (forward slots) this channel
 // will send to each scale-out destination. Warp-wide: each lane scans a stride, then the per-lane
@@ -93,8 +113,9 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumDataWarps = kNumScaleupWarps + kNumForwardWarps,
-          int kProxyWarpIdx = kNumDataWarps,
-          int kNumWarps = kNumDataWarps + 1,
+          int kProxyWarpIdx = use_combine_padded_warpgroups(kUseExpandedLayout, kNumScaleupWarps, kNumForwardWarps) ?
+                              kNumScaleupWarps : kNumDataWarps,
+          int kNumWarps = kProxyWarpIdx != kNumDataWarps ? 16 : kNumDataWarps + 1,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           bool kUseScaleoutRankLayout = use_rank_layout<kAllowMultipleReduction, kNumScaleoutRanks, kNumTopk>(),
@@ -120,6 +141,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     const auto lane_idx = ptx::get_lane_idx();
     constexpr bool kDoExpandedSend = not kAllowMultipleReduction and kUseExpandedLayout;
 
+    // Warp roles: `[0, kNumScaleupWarps)` scale-up, `[kFirstForwardWarp, kFirstForwardWarp + kNumForwardWarps)`
+    // forward, `kProxyWarpIdx` proxy; with padded warpgroups the other warps are pads
+    constexpr bool kPaddedWarpgroups = kProxyWarpIdx != kNumDataWarps;
+    constexpr int kFirstForwardWarp = kPaddedWarpgroups ? 8 : kNumScaleupWarps;
+    EP_STATIC_ASSERT(not kPaddedWarpgroups or
+                     (kNumWarps == 16 and kNumChannelsPerSM == kNumForwardWarps and
+                      kNumScaleupWarps >= 4 and kProxyWarpIdx < 8 and kNumForwardWarps <= 8), "Invalid padded warpgroup layout");
+    // Data-warp index (TMA buffer, channel in the SM) of the current warp, or -1 for the proxy and pad warps
+    const int data_warp_idx = not kPaddedWarpgroups ? (warp_idx < kNumDataWarps ? warp_idx : -1) :
+        warp_idx < kNumScaleupWarps ? warp_idx :
+        (warp_idx >= kFirstForwardWarp and warp_idx < kFirstForwardWarp + kNumForwardWarps) ?
+            warp_idx - kFirstForwardWarp + kNumScaleupWarps : -1;
+    if constexpr (kPaddedWarpgroups)
+        EP_DEVICE_ASSERT(blockDim.x == kNumThreads);
+
     // Combine vector type selection
     using combine_vec_t = typename CombineVecTraits<kNumHiddenBytes>::vec_t;
     constexpr int kHiddenVec = kNumHiddenBytes / sizeof(combine_vec_t);
@@ -139,7 +175,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     const auto tma_buffer_layout = layout::BufferLayout<true>(token_layout, kNumDataWarps, 1, smem);
     // The proxy warp never touches `tma_buffer`, clamp its index to 0.
     const auto tma_buffer = tma_buffer_layout
-        .get_rank_buffer(warp_idx < kNumDataWarps ? warp_idx : 0).get_token_buffer(0);
+        .get_rank_buffer(kPaddedWarpgroups ? (data_warp_idx >= 0 ? data_warp_idx : 0) :
+                         (warp_idx < kNumDataWarps ? warp_idx : 0)).get_token_buffer(0);
 
     // Proxy warp hand-off rings — placed in `smem[]` right after the TMA buffers.
     const auto proxy_ring_layout = ProxyRingLayout(
@@ -173,7 +210,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
     // NCCL Gin handle
     // For data warp, each warp is a channel, for proxy warp each lane is a channel.
-    const auto gin_channel_in_sm = warp_idx < kNumDataWarps ?
+    const auto gin_channel_in_sm = kPaddedWarpgroups ?
+        (data_warp_idx >= 0 ? (data_warp_idx % kNumChannelsPerSM) : (lane_idx < kNumForwardWarps ? lane_idx : 0)) :
+        warp_idx < kNumDataWarps ?
         (warp_idx % kNumChannelsPerSM) :
         (lane_idx < kNumForwardWarps ? lane_idx : 0);
     const auto [qp_idx, sharing_mode] =
@@ -200,11 +239,20 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
     // Adjust register count at certain cases
     // TODO: support more cases, or try to make channel count more aligned
-    const bool kAdjustRegisters = (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8) and not kUseExpandedLayout;
+    const bool kAdjustRegisters = (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8 or kPaddedWarpgroups) and not kUseExpandedLayout;
     constexpr int kNumRegistersForScaleupWarps = 40;
     constexpr int kNumRegistersForWarpPair = (kNumChannelsPerSM == 8) ? 192 : 256;
-    constexpr int kNumRegistersForForwardWarps =
+    constexpr int kNumRegistersForForwardWarps = kPaddedWarpgroups ? EP_COMBINE_SPLIT7_FWD_REGS :
         kNumRegistersForWarpPair - kNumRegistersForScaleupWarps;
+    if constexpr (kPaddedWarpgroups) {
+        // `setmaxnreg.inc` takes from the CTA's pool, so the split must fit in what the CTA was launched with,
+        // or the forward warpgroups never get their registers. The launch count is the `__launch_bounds__`
+        // cap ptxas applies, 64K over the warps rounded up to whole warpgroups (128 at 16 warps).
+        constexpr int kNumEntryRegisters = 65536 / (math::constexpr_ceil_div(kNumWarps, 4) * 4 * 32) / 8 * 8;
+        EP_STATIC_ASSERT(kNumRegistersForForwardWarps % 8 == 0 and kNumRegistersForForwardWarps <= 256 and
+                         4 * kNumRegistersForScaleupWarps + 4 * kNumEntryRegisters + 8 * kNumRegistersForForwardWarps
+                             <= kNumWarps * kNumEntryRegisters, "Invalid register split");
+    }
 
     // Different warp roles
     if (warp_idx < kNumScaleupWarps) {
@@ -220,8 +268,13 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
 
         // Adjust registers
-        if constexpr (kAdjustRegisters)
+        // With padded warpgroups only warpgroup 0 is scale-up alone, warpgroup 1 also holds the proxy
+        if constexpr (kAdjustRegisters and kPaddedWarpgroups) {
+            if (warp_idx < 4)
+                ptx::warpgroup_reg_dealloc<kNumRegistersForScaleupWarps>();
+        } else if constexpr (kAdjustRegisters) {
             ptx::warpgroup_reg_dealloc<kNumRegistersForScaleupWarps>();
+        }
 
         // Shift into the right buffer if using rank layout
         if constexpr (kUseScaleupRankLayout)
@@ -465,8 +518,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Update for the unissued ones
         update_tails(true);
-    } else if (warp_idx < kNumDataWarps) {
-        const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
+    } else if (kPaddedWarpgroups ? warp_idx >= kFirstForwardWarp : warp_idx < kNumDataWarps) {
+        const auto forward_warp_idx = warp_idx - kFirstForwardWarp;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
         // Rebuild this warp's TMA buffer handle here instead of keeping the pre-split one live across
         // the role split. As a kernel-wide value it is the register ptxas spills first when the
@@ -475,12 +528,19 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // compiler cannot merge this handle with the one computed before the split.
         unsigned opaque_tid;
         asm volatile("mov.u32 %0, %%tid.x;" : "=r"(opaque_tid));
-        const auto tma_buffer = tma_buffer_layout.get_rank_buffer(static_cast<int>(opaque_tid >> 5)).get_token_buffer(0);
+        const auto tma_buffer = tma_buffer_layout.get_rank_buffer(
+            static_cast<int>(opaque_tid >> 5) - (kFirstForwardWarp - kNumScaleupWarps)).get_token_buffer(0);
         const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
 
         // Adjust registers
         if constexpr (kAdjustRegisters)
             ptx::warpgroup_reg_alloc<kNumRegistersForForwardWarps>();
+
+        // Pad warps only join the warpgroup's `setmaxnreg`
+        if constexpr (kPaddedWarpgroups) {
+            if (forward_warp_idx >= kNumForwardWarps)
+                return;
+        }
 
         constexpr int kNumSlotsPerChannel = kNumMaxTokensPerChannel * (kAllowMultipleReduction ? 1 : kNumTopk);
         scaleout_send_buffer = scaleout_send_buffer.get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
@@ -805,6 +865,12 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         __syncwarp();
 
     } else {
+        // Pad warps between the proxy and the forward warpgroups have nothing to do
+        if constexpr (kPaddedWarpgroups) {
+            if (warp_idx != kProxyWarpIdx)
+                return;
+        }
+
         // Count the arrivals this SM must wait for.
         //
         // The rule is "distinct valid non-local packed entries per token", scanned out of

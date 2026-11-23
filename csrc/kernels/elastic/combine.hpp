@@ -141,6 +141,34 @@ static void __instantiate_kernel() {{
     }
 };
 
+// Experiment: the `EP_COMBINE_SPLIT7` level the JIT compiles the combine with, which reaches the kernel only
+// through `EP_JIT_EXTRA_FLAGS` (`-DEP_COMBINE_SPLIT7[=<level>]`, the last one wins); 0 when absent
+static int get_combine_split7_level() {
+    static const int level = [] {
+        const auto flags = get_env<std::string>("EP_JIT_EXTRA_FLAGS");
+        const std::string key = "-DEP_COMBINE_SPLIT7";
+        int result = 0;
+        for (auto pos = flags.find(key); pos != std::string::npos; pos = flags.find(key, pos + 1)) {
+            const auto end = pos + key.size();
+            if (end == flags.size() or flags[end] == ',' or flags[end] == ' ')
+                result = 1;
+            else if (flags[end] == '=')
+                result = std::atoi(flags.c_str() + end + 1);
+        }
+        return result;
+    }();
+    return level;
+}
+
+// Mirrors `use_combine_padded_warpgroups` in `hybrid_combine_unordered.cuh`: the padded layout launches
+// 16 warps (scale-up, proxy and pads in warpgroups 0-1, forward and pads in warpgroups 2-3)
+static bool use_combine_padded_warpgroups(const bool& use_expanded_layout, const int& num_channels_per_sm) {
+    const auto level = get_combine_split7_level();
+    return not use_expanded_layout and
+           ((level >= 1 and num_channels_per_sm == 7) or
+            (level >= 2 and num_channels_per_sm >= 5 and num_channels_per_sm <= 7));
+}
+
 static layout::TokenLayout get_combine_token_layout(
     const int& hidden, const int& elem_size, const int& num_topk) {
     return layout::TokenLayout(hidden * elem_size, 0, num_topk, false);
@@ -189,6 +217,8 @@ static void* launch_combine(void* x,
         } else {
             const auto num_data_warps = num_scaleup_warps + num_forward_warps;
             num_warps = num_data_warps + 1;
+            if (use_thread_put_unordered_kernels() and use_combine_padded_warpgroups(use_expanded_layout, num_forward_warps))
+                num_warps = 16;
             EP_HOST_ASSERT(num_warps * 32 <= 1024 and
                            "combine warp count (scale-up + forward + proxy) exceeds the "
                            "1024-thread block limit; use at least num_channels / 15 SMs");
