@@ -23,7 +23,110 @@
 #define EP_COMBINE_BATCH_SIZE 6
 #endif
 
+// Experiment levers for the start and the tail of the kernel, set through the JIT flags (`EP_JIT_EXTRA_FLAGS`).
+// Every lever defaults to off, and with all of them off the kernel is the plain design.
+//
+// A scale-up warp that has sent all its tokens helps the forward warp of its channel with the local tokens: the
+// two warps take local tokens from one shared-memory cursor, so each local token is reduced exactly once.
+#ifndef EP_COMBINE_SU_HELP
+#define EP_COMBINE_SU_HELP 0
+#endif
+// Hand the put of a remote destination to the proxy right after the TMA store of the token that ends it, instead of
+// at the next token's buffer reuse, which waits for that token's scale-up data. 1: the last put of a destination
+// only; 2: every put. The puts themselves are unchanged.
+#ifndef EP_COMBINE_EARLY_FINAL
+#define EP_COMBINE_EARLY_FINAL 0
+#endif
+// Put ramp: the first EP_COMBINE_RAMP_PUTS puts of every (channel, destination) carry EP_COMBINE_RAMP_TOKENS
+// tokens, the later ones the batch size. Every put still signals 1; the sender and the receiver both derive the
+// put count of a (channel, destination) from `combine_num_puts`.
+#ifndef EP_COMBINE_RAMP_TOKENS
+#define EP_COMBINE_RAMP_TOKENS 0
+#endif
+#ifndef EP_COMBINE_RAMP_PUTS
+#define EP_COMBINE_RAMP_PUTS 0
+#endif
+// The scale-up warps publish their tails after each of the first EP_COMBINE_EARLY_ROWS rows of the linked list
+// (later rows keep the interval), so the forward warps see their first tokens earlier.
+#ifndef EP_COMBINE_EARLY_ROWS
+#define EP_COMBINE_EARLY_ROWS 0
+#endif
+// Until the proxy warp of an SM has issued EP_COMBINE_PROXY_EAGER_PUTS puts, it drains a round as soon as any
+// descriptor is pending instead of waiting for one descriptor per forward warp, so the first puts leave earlier.
+#ifndef EP_COMBINE_PROXY_EAGER_PUTS
+#define EP_COMBINE_PROXY_EAGER_PUTS 0
+#endif
+// Nanoseconds the proxy warp sleeps when a round is held back
+#ifndef EP_COMBINE_PROXY_SLEEP_NS
+#define EP_COMBINE_PROXY_SLEEP_NS 1000
+#endif
+
 namespace deep_ep::elastic {
+
+constexpr bool kCombinePutRamp = EP_COMBINE_RAMP_TOKENS > 0 and EP_COMBINE_RAMP_PUTS > 0;
+
+// Tokens carried by the put after `num_puts_issued` puts of one (channel, destination)
+template <int kBatchSize>
+__device__ __forceinline__ int combine_put_tokens(const int& num_puts_issued) {
+    if constexpr (kCombinePutRamp) {
+        EP_STATIC_ASSERT(EP_COMBINE_RAMP_TOKENS < kBatchSize, "The ramp puts must be smaller than a batch");
+        return num_puts_issued < EP_COMBINE_RAMP_PUTS ? EP_COMBINE_RAMP_TOKENS : kBatchSize;
+    }
+    return kBatchSize;
+}
+
+// Number of puts of one (channel, destination) that carries `num_tokens` tokens, the last put possibly partial
+template <int kBatchSize>
+__device__ __forceinline__ int combine_num_puts(const int& num_tokens) {
+    if constexpr (kCombinePutRamp) {
+        constexpr int kNumRampTokens = EP_COMBINE_RAMP_TOKENS * EP_COMBINE_RAMP_PUTS;
+        if (num_tokens <= kNumRampTokens)
+            return math::ceil_div(num_tokens, EP_COMBINE_RAMP_TOKENS);
+        return EP_COMBINE_RAMP_PUTS + math::ceil_div(num_tokens - kNumRampTokens, kBatchSize);
+    }
+    return math::ceil_div(num_tokens, kBatchSize);
+}
+
+// Number of entries of a forward list FIFO, starting at entry `first` and stepping by `stride`: the index of its
+// `-1` sentinel. Warp-wide; `kMaxEntries` bounds the probe to the list.
+template <int kNumForwardMetadataDims, int kMaxEntries>
+__device__ __forceinline__ int count_forward_fifo_entries(const int* list, const int& first, const int& stride,
+                                                          const int& lane_idx) {
+    for (int base = 0; ; base += 32) {
+        const int idx = base + lane_idx;
+        const bool alive = idx < kMaxEntries and __ldg(list + (first + stride * idx) * kNumForwardMetadataDims) >= 0;
+        const unsigned alive_mask = ptx::gather(alive);
+        if (alive_mask != 0xffffffffu)
+            return base + __ffs(static_cast<int>(~alive_mask)) - 1;
+    }
+}
+
+// For the scale-up rank of this lane, the number of forward list entries among `num_entries` entries (from entry
+// `first`, stepping by `stride`) that read from that rank. Warp-wide, one entry per lane.
+template <int kNumForwardMetadataDims, int kNumTopk, int kNumScaleupRanks>
+__device__ __forceinline__ int count_forward_entries_per_scaleup_rank(const int* list, const int& first,
+                                                                      const int& stride, const int& num_entries,
+                                                                      const int& lane_idx) {
+    EP_STATIC_ASSERT(kNumScaleupRanks <= 32, "One lane per scale-up rank");
+    int count = 0;
+    for (int base = 0; base < num_entries; base += 32) {
+        unsigned mask = 0;
+        if (base + lane_idx < num_entries) {
+            const auto entry = list + (first + stride * (base + lane_idx)) * kNumForwardMetadataDims + 2;
+            #pragma unroll
+            for (int k = 0; k < kNumTopk; ++ k) {
+                const auto r = __ldg(entry + k);
+                mask |= r >= 0 ? (1u << r) : 0u;
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < kNumScaleupRanks; ++ r) {
+            const int n = __popc(ptx::gather(((mask >> r) & 1u) != 0));
+            count += lane_idx == r ? n : 0;
+        }
+    }
+    return count;
+}
 
 // Iterate the whole forward metadata list and count how many tokens (forward slots) this channel
 // will send to each scale-out destination. Warp-wide: each lane scans a stride, then the per-lane
@@ -144,10 +247,24 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // Proxy warp hand-off rings — placed in `smem[]` right after the TMA buffers.
     const auto proxy_ring_layout = ProxyRingLayout(
         kNumForwardWarps, kProxyRingDepth, tma_buffer_layout.get_buffer_end_ptr());
+
+    // Scale-up helper (EP_COMBINE_SU_HELP): per channel of the SM, the cursor of the next local token in the
+    // forward list, shared by the forward warp and the scale-up warp of the channel, the helper's done flag, and
+    // the forward warp's copy of the local FIFO length. The words are right after the rings (`kCombineHelperSmemBytes` in the host launch). The helper runs the
+    // forward reduce, so not where the scale-up warps run with fewer registers (4 or 8 channels).
+    constexpr bool kSuHelp = EP_COMBINE_SU_HELP and kAllowMultipleReduction and
+        kNumScaleupWarps == kNumChannelsPerSM and kNumScaleupRanks <= 32 and
+        not (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8);
+    int* const help_cursor = static_cast<int*>(proxy_ring_layout.get_end_ptr());
+    int* const help_done = help_cursor + kNumForwardWarps;
+    int* const help_num_local = help_done + kNumForwardWarps;
+
     for (int f = thread_idx; f < kNumForwardWarps; f += kNumThreads) {
         *proxy_ring_layout.get_head(f) = 0;
         *proxy_ring_layout.get_tail(f) = 0;
         *proxy_ring_layout.get_done(f) = 0;
+        if constexpr (kSuHelp)
+            help_cursor[f] = 0, help_done[f] = 0;
     }
     __syncthreads();
 
@@ -234,12 +351,16 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // Tail issuer
         // `st.release.sys` is pretty slow, so do it by an interval
         int update_counter = 0;
+        [[maybe_unused]] int num_rows_done = 0;
         int stored_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         int stored_old_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
         const auto update_tails = [&](const bool& finish = false) {
             ++ update_counter;
-            if (finish or update_counter == kNumScaleupUpdateInterval) {
+            bool early_row = false;
+            if constexpr (EP_COMBINE_EARLY_ROWS > 0)
+                early_row = ++ num_rows_done <= EP_COMBINE_EARLY_ROWS;
+            if (finish or update_counter == kNumScaleupUpdateInterval or early_row) {
                 // Wait all TMA stores to finish
                 ptx::tma_store_wait();
                 __syncwarp();
@@ -465,6 +586,137 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Update for the unissued ones
         update_tails(true);
+
+        if constexpr (kSuHelp) {
+            // Help the forward warp of this channel with its local tokens (source scale-out rank is this rank, so
+            // no puts, and the recv slot of a local token is its position in the local FIFO). The two warps take
+            // positions from one cursor, so each local token is reduced once, by whichever warp took it.
+            //
+            // A forward warp consumes the scale-up data of rank `r` in forward list order: the n-th entry that
+            // reads from `r` waits until the tail of `r` exceeds n. Taking positions out of order, a warp counts
+            // the entries it skipped (taken by the other warp) into its own ordinal before waiting.
+            constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
+            constexpr int kNumSlotsPerChannel = kNumMaxTokensPerChannel;
+            const int* const forward_list = token_metadata_at_forward +
+                channel_idx * ((kForwardListTop + 1) * kNumForwardMetadataDims);
+            const auto recv_buffer = scaleout_recv_buffer
+                .get_channel_buffer<kNumSlotsPerChannel>(channel_idx)
+                .get_rank_buffer(scaleout_rank_idx);
+            // The forward warps read the scale-up buffer from its base (this warp's view is shifted to its rank)
+            const auto forward_scaleup_buffer = layout::BufferLayout<false>(
+                token_layout, kNumTokensInScaleupLayout, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
+            int* const cursor = help_cursor + warp_idx;
+
+            const auto take_position = [&]() {
+                int position = 0;
+                if (lane_idx == 0)
+                    position = atomicAdd(cursor, 1);
+                return __shfl_sync(0xffffffffu, position, 0);
+            };
+
+            const int num_local = count_forward_fifo_entries<kNumForwardMetadataDims, kForwardListTop + 1>(
+                forward_list, kForwardListTop, -1, lane_idx);
+            int position = take_position();
+            if (position < num_local) {
+                // Ordinal base: the remote FIFO comes first in the forward list order
+                const int num_remote = count_forward_fifo_entries<kNumForwardMetadataDims, kForwardListTop + 1>(
+                    forward_list, 0, 1, lane_idx);
+                int num_tokens_recv = count_forward_entries_per_scaleup_rank<kNumForwardMetadataDims, kNumTopk, kNumScaleupRanks>(
+                    forward_list, 0, 1, num_remote, lane_idx);
+                int cached_scaleup_tail = 0, num_positions_counted = 0;
+                for (; position < num_local; position = take_position()) {
+                    num_tokens_recv += count_forward_entries_per_scaleup_rank<kNumForwardMetadataDims, kNumTopk, kNumScaleupRanks>(
+                        forward_list, kForwardListTop - num_positions_counted, -1, position - num_positions_counted, lane_idx);
+                    num_positions_counted = position + 1;
+
+                    const auto entry = forward_list + (kForwardListTop - position) * kNumForwardMetadataDims;
+                    const auto src_token_global_idx = __ldg(entry);
+                    const auto stored_src_scaleup_rank_idx = lane_idx < kNumTopk ? __ldg(entry + 2 + lane_idx) : -1;
+                    const auto stored_src_slot_idx = lane_idx < kNumTopk ? __ldg(entry + 2 + kNumTopk + lane_idx) : -1;
+                    if constexpr (kDebugChecks & kDebugCheckTokenSync)
+                        EP_DEVICE_ASSERT(src_token_global_idx / (kNumMaxTokensPerRank * kNumScaleupRanks) == scaleout_rank_idx);
+
+                    // Wait for the scale-up data of this entry
+                    const auto scaleup_mask = ptx::reduce_or(
+                        stored_src_scaleup_rank_idx >= 0 ? (1u << stored_src_scaleup_rank_idx) : 0u);
+                    const bool needed = lane_idx < kNumScaleupRanks and ((scaleup_mask >> lane_idx) & 1u);
+                    comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                        if (ptx::all(not needed or num_tokens_recv < cached_scaleup_tail))
+                            return true;
+                        cached_scaleup_tail = lane_idx < kNumScaleupRanks ?
+                            ptx::ld_acquire_sys(workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, lane_idx)) : 0;
+                        if (is_last_check and lane_idx < kNumScaleupRanks) {
+                            printf("DeepEP combine (scale-up helper wait) timeout, scale-out: %d/%d, scale-up: %d/%d, "
+                                   "channel: %d, lane: %d, position: %d/%d, recv: %d, tail: %d (wait=%d)\n",
+                                   scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
+                                   channel_idx, lane_idx, position, num_local, num_tokens_recv,
+                                   cached_scaleup_tail, needed);
+                        }
+                        return false;
+                    });
+                    num_tokens_recv += needed;
+
+                    // Reduce, as the forward warp does
+                    auto reduce_valid_mask = ptx::gather(
+                        ptx::deduplicate(stored_src_scaleup_rank_idx, lane_idx) and stored_src_scaleup_rank_idx >= 0);
+                    int stored_src_buffer_idx = 0;
+                    if constexpr (kUseScaleupRankLayout) {
+                        stored_src_buffer_idx =
+                            stored_src_scaleup_rank_idx * forward_scaleup_buffer.num_max_tokens_per_rank + stored_src_slot_idx;
+                    } else {
+                        const auto src_slot_idx = scaleout_rank_idx * kNumMaxTokensPerRank +
+                            src_token_global_idx % kNumMaxTokensPerRank;
+                        stored_src_buffer_idx = stored_src_slot_idx == -1 ? -1 :
+                            lane_idx * forward_scaleup_buffer.num_max_tokens_per_rank + src_slot_idx;
+                    }
+                    int topk_slot_idx[kNumTokensInScaleupLayout];
+                    compute_topk_slots(
+                        topk_slot_idx, reduce_valid_mask,
+                        [=](const int& idx) {
+                            return ptx::exchange(stored_src_buffer_idx, idx);
+                        }
+                    );
+                    constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
+                    combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumScaleoutRanks)>(
+                        lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                        /* Get source base */ [=](const int& slot_idx) {
+                            return static_cast<combine_vec_t*>(
+                                forward_scaleup_buffer.get_token_buffer(slot_idx, true).get_base_ptr());
+                        },
+                        /* Wait buffer release */ [=]() {
+                            ptx::tma_store_wait();
+                            __syncwarp();
+                        }
+                    );
+
+                    // Merge top-k weights (the slot indices follow the master lane)
+                    stored_src_buffer_idx = ptx::exchange(
+                        stored_src_buffer_idx, ptx::get_master_lane_idx(ptx::match(stored_src_scaleup_rank_idx)));
+                    if (stored_src_scaleup_rank_idx >= 0) {
+                        tma_buffer.get_topk_weights_ptr()[lane_idx] =
+                            forward_scaleup_buffer.get_token_buffer(stored_src_buffer_idx, true)
+                                .get_topk_weights_ptr()[lane_idx];
+                    }
+                    ptx::tma_store_fence();
+                    __syncwarp();
+
+                    // Into the local recv slot
+                    if (ptx::elect_one_sync()) {
+                        ptx::tma_store_1d(recv_buffer.get_token_buffer(position).get_base_ptr(),
+                                          tma_buffer.get_base_ptr(), token_layout.get_num_bytes<false>());
+                        ptx::tma_store_commit();
+                    }
+                    __syncwarp();
+                }
+                ptx::tma_store_wait();
+                __syncwarp();
+            }
+
+            // Always signal: the forward warp waits for it before cleaning the scale-up tails this warp read
+            if (ptx::elect_one_sync())
+                ptx::st_release_cta(help_done + warp_idx, 1);
+            __syncwarp();
+        }
     } else if (warp_idx < kNumDataWarps) {
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
@@ -510,6 +762,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         int batch_count[kNumScaleoutRanks] = {};
         int batch_start_slot[kNumScaleoutRanks];
+        // Puts handed to the proxy per destination, for the put ramp (EP_COMBINE_RAMP_*)
+        [[maybe_unused]] int num_puts_issued[kNumScaleoutRanks] = {};
 
         ProxyPutDesc* const my_ring = proxy_ring_layout.get_ring(forward_warp_idx);
         unsigned& my_head = *proxy_ring_layout.get_head(forward_warp_idx);
@@ -557,6 +811,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             ptx::st_release_cta(&my_head, my_head + 1);
 
             batch_count[dst] = 0;
+            if constexpr (kCombinePutRamp or EP_COMBINE_EARLY_FINAL >= 2)
+                ++ num_puts_issued[dst];
         };
 
         // Update per Channel/ScaleOutRank batch metadata and GIN PUT when threshold met
@@ -568,8 +824,13 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             // A destination whose tokens are all handled will get no more, so forward its batch
             // now instead of waiting for it to fill.
             const bool dst_exhausted = (-- num_slots_remaining_per_dst[dst] == 0);
-            if (batch_count[dst] == kBatchSize or dst_exhausted)
-                issue_batched_rdma(dst);
+            if constexpr (kCombinePutRamp) {
+                if (batch_count[dst] == combine_put_tokens<kBatchSize>(num_puts_issued[dst]) or dst_exhausted)
+                    issue_batched_rdma(dst);
+            } else {
+                if (batch_count[dst] == kBatchSize or dst_exhausted)
+                    issue_batched_rdma(dst);
+            }
 
             // All tokens for every destination are used: tell the proxy immediately so it can
             // stop waiting for more descriptors on this ring.
@@ -593,11 +854,49 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // Replay the dispatch
         constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
+
+        // Scale-up helper (EP_COMBINE_SU_HELP): the local FIFO is taken position by position from the cursor
+        // shared with the scale-up warp of this channel (see there)
+        // The length of the local FIFO is kept in shared memory, to keep it out of the loop's registers
+        [[maybe_unused]] int num_local_positions_counted = 0;
+        if constexpr (kSuHelp) {
+            const int num_local_tokens = count_forward_fifo_entries<kNumForwardMetadataDims, kForwardListTop + 1>(
+                token_metadata_at_forward, kForwardListTop, -1, lane_idx);
+            if (lane_idx == 0)
+                help_num_local[forward_warp_idx] = num_local_tokens;
+            __syncwarp();
+        }
+
         for (int i = 0, step = 1; ; i += step) {
-            auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
-            if (src_token_global_idx < 0 and step > 0) {
-                i = kForwardListTop, step = -1;
+            int src_token_global_idx;
+            if constexpr (kSuHelp) {
+                if (step > 0) {
+                    src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+                    if (src_token_global_idx < 0)
+                        step = -1;
+                }
+                if (step < 0) {
+                    int position = 0;
+                    if (lane_idx == 0)
+                        position = atomicAdd(help_cursor + forward_warp_idx, 1);
+                    position = min(__shfl_sync(0xffffffffu, position, 0), help_num_local[forward_warp_idx]);
+
+                    // Count the positions the helper took into this warp's ordinals
+                    stored_num_tokens_recv[0] += count_forward_entries_per_scaleup_rank<kNumForwardMetadataDims, kNumTopk, kNumScaleupRanks>(
+                        token_metadata_at_forward, kForwardListTop - num_local_positions_counted, -1,
+                        position - num_local_positions_counted, lane_idx);
+                    num_local_positions_counted = position + 1;
+
+                    // The sentinel once the cursor passed the end
+                    i = kForwardListTop - position;
+                    src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+                }
+            } else {
                 src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+                if (src_token_global_idx < 0 and step > 0) {
+                    i = kForwardListTop, step = -1;
+                    src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+                }
             }
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
             const auto src_scaleout_rank_idx = src_rank_idx / kNumScaleupRanks;
@@ -756,7 +1055,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                 // Assign send and receive buffers
                 // NOTES: as we only have 1 destination, we will use "send" as "recv" for local transfer
-                const int recv_slot = slot_of_per_channel[src_scaleout_rank_idx];
+                // NOTES: with the scale-up helper the local FIFO is taken out of order, and a local token's slot
+                // is its position in that FIFO
+                int recv_slot = slot_of_per_channel[src_scaleout_rank_idx];
+                if constexpr (kSuHelp)
+                    recv_slot = step < 0 ? num_local_positions_counted - 1 : recv_slot;
                 const auto recv_token_buffer = scaleout_recv_buffer
                     .get_rank_buffer(scaleout_rank_idx)
                     .get_token_buffer(recv_slot);
@@ -778,6 +1081,22 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 // Record RDMA info to issue later
                 last_src_scaleout_rank_idx = src_scaleout_rank_idx;
                 last_slot_written = recv_slot;
+
+                // Early put (EP_COMBINE_EARLY_FINAL): if this token ends a put, record it now instead of at the
+                // next token's buffer reuse. The batch state lives in the lane that `elect_one_sync` picks.
+                if constexpr (EP_COMBINE_EARLY_FINAL > 0) {
+                    bool ends_put = false;
+                    if (src_scaleout_rank_idx != scaleout_rank_idx and ptx::elect_one_sync()) {
+                        ends_put = num_slots_remaining_per_dst[src_scaleout_rank_idx] == 1;
+                        if constexpr (EP_COMBINE_EARLY_FINAL >= 2)
+                            ends_put |= batch_count[src_scaleout_rank_idx] + 1 ==
+                                combine_put_tokens<kBatchSize>(num_puts_issued[src_scaleout_rank_idx]);
+                    }
+                    if (ptx::any(ends_put)) {
+                        flush_last_tma_and_record_batch();
+                        last_src_scaleout_rank_idx = -1;
+                    }
+                }
             }
         }
 
@@ -794,6 +1113,19 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             ptx::st_release_cta(proxy_ring_layout.get_done(forward_warp_idx), 1);
         }
         __syncwarp();
+
+        // The scale-up helper reads the scale-up tails too: wait for it before cleaning them
+        if constexpr (kSuHelp) {
+            comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                if (ptx::ld_acquire_cta(help_done + forward_warp_idx) != 0)
+                    return true;
+                if (is_last_check and ptx::elect_one_sync())
+                    printf("DeepEP combine (scale-up helper done) timeout, scale-out: %d, scale-up: %d, channel: %d\n",
+                           scaleout_rank_idx, scaleup_rank_idx, channel_idx);
+                return false;
+            });
+            __syncwarp();
+        }
 
         // Clean scaleup tails
         #pragma unroll
@@ -857,7 +1189,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             #pragma unroll
             for (int r = 0; r < kNumScaleoutRanks; ++ r)
                 sm_num_expected_arrivals +=
-                    math::ceil_div(ptx::reduce_add(local_expected_count_per_rank[r]), kBatchSize);
+                    combine_num_puts<kBatchSize>(ptx::reduce_add(local_expected_count_per_rank[r]));
         }
         __syncwarp();
 
@@ -922,8 +1254,16 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                 // Wait for one descriptor per forward warp, then send them all under one
                 // doorbell. A floor, not a cap. Exempt in the tail, which would wait forever.
-                const bool drain_now = total_pending > 0 and
-                                       (total_pending >= kNumForwardWarps or any_ring_finished);
+                bool drain_now = total_pending > 0 and
+                                 (total_pending >= kNumForwardWarps or any_ring_finished);
+                if constexpr (EP_COMBINE_PROXY_EAGER_PUTS > 0) {
+                    // The ring tails count the puts issued so far
+                    unsigned num_puts_issued = 0;
+                    #pragma unroll
+                    for (int f = 0; f < kNumForwardWarps; ++ f)
+                        num_puts_issued += tail[f];
+                    drain_now |= total_pending > 0 and num_puts_issued < static_cast<unsigned>(EP_COMBINE_PROXY_EAGER_PUTS);
+                }
 
                 const auto issue_put = [&](const ProxyPutDesc& d, const int& ring_idx,
                                            const bool& ring_doorbell) {
@@ -939,9 +1279,10 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 };
 
                 if (not drain_now) {
-                    __nanosleep(1000);
+                    __nanosleep(EP_COMBINE_PROXY_SLEEP_NS);
                     continue;
                 }
+
 
                 // Pass 2: drain the whole snapshot. Anything queued mid-round waits for the next.
                 //

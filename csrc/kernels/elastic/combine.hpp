@@ -195,10 +195,12 @@ static void* launch_combine(void* x,
 
             // TMA buffers and the proxy hand-off rings both live in the dynamic shmem arena; the
             // rings are placed after the TMA region (see hybrid_combine_unordered.cuh) so no alignment pad is
-            // needed. Bound by the same total the channel auto-tuner sized against.
+            // needed. The words of the scale-up helper follow the rings, counted whether the helper is compiled
+            // in or not. Bound by the same total the channel auto-tuner sized against.
             const int64_t tma_smem_bytes = static_cast<int64_t>(num_data_warps) * token_layout.get_num_bytes<true>();
             const int64_t proxy_ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
-                num_forward_warps, deep_ep::elastic::kProxyRingDepthDefault);
+                num_forward_warps, deep_ep::elastic::kProxyRingDepthDefault) +
+                static_cast<int64_t>(num_forward_warps) * deep_ep::elastic::kCombineHelperWordsPerForwardWarp * sizeof(int);
             // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
             EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
                            "Combine TMA buffers + proxy rings exceed per-block shared memory");

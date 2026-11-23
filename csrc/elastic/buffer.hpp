@@ -945,14 +945,16 @@ public:
                 if (get_env<int>("EP_BUFFER_DEBUG"))
                     printf("[DEBUG] DeepEP GIN resolved channels per SM: %d\n", num_channels_per_sm);
             }
-            // The unordered combine also carves the proxy hand-off rings out of the
-            // same dynamic shared memory as its TMA buffers; shrink the channel count
+            // The unordered combine also carves the proxy hand-off rings (and the words of its
+            // scale-up helper) out of the same dynamic shared memory as its TMA buffers; shrink the channel count
             // until both fit (see the matching assert in `launch_combine`).
             while (num_channels_per_sm > 1 and
                    static_cast<int64_t>(2 * num_channels_per_sm) *
                            combine_token_layout.get_num_bytes<true, int64_t>() +
                        elastic::ProxyRingLayout::get_num_bytes(num_channels_per_sm,
-                                                               elastic::kProxyRingDepthDefault) >
+                                                               elastic::kProxyRingDepthDefault) +
+                       static_cast<int64_t>(num_channels_per_sm) *
+                           elastic::kCombineHelperWordsPerForwardWarp * sizeof(int) >
                    num_smem_bytes)
                 -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
