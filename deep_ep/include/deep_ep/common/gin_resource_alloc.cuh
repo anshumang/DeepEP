@@ -51,6 +51,9 @@ static constexpr int kDefaultGinContextCnt       = 13;
 // an NCCL without the thread-exclusive put: there the JIT selects that generation's kernels
 // (`use_thread_put_unordered_kernels`), and this keeps their QP layout the same as well.
 static constexpr int kLegacyGinContextCnt        = 11;
+// The previous kernels were validated only with the original GIN layout, whose provider ceiling
+// was 17 contexts. Keep explicit `num_allocated_qps` requests inside that same layout too.
+static constexpr int kLegacyMaxGinContextCnt     = 17;
 
 // Per-context indexed-signal budget, workaround for current limitations in provider.
 __forceinline__ __device__ __host__ constexpr int gin_indexed_signals_for(int gin_context_cnt) {
@@ -67,6 +70,19 @@ __forceinline__ __host__ constexpr int max_gin_context_cnt_for_rail(int num_rail
     const int cap = kTotalQPBudget / (num_rail_ranks + 1);
     return cap < kMaxGinContextCnt ? cap : kMaxGinContextCnt;
 }
+
+__forceinline__ __host__ constexpr int max_gin_context_cnt(
+        int num_rail_ranks, bool use_thread_put) {
+    const int rail_cap = max_gin_context_cnt_for_rail(num_rail_ranks);
+    return use_thread_put or rail_cap < kLegacyMaxGinContextCnt
+        ? rail_cap
+        : kLegacyMaxGinContextCnt;
+}
+
+static_assert(max_gin_context_cnt(2, false) == kLegacyMaxGinContextCnt);
+static_assert(max_gin_context_cnt(2, true) == kMaxGinContextCnt);
+static_assert(max_gin_context_cnt(16, false) == 15);
+static_assert(max_gin_context_cnt(16, true) == 15);
 
 // Each ScaleOut warp (== channel) needs its own indexed signal id on its QP, shared by all
 // nodes of the rail. The signals per context fall as the context count grows, so checking the
